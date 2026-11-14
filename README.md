@@ -18,20 +18,24 @@ A sessão é temporária; potes e objetos não são salvos entre execuções.
 
 Tocar na tela continua funcionando exatamente como a pinça.
 
-No canto superior direito ficam os números de desempenho: `fps` da tela, `mão N Hz` (resultados de rastreamento por segundo) e o custo em milissegundos de cada quadro rastreado.
+No canto superior direito ficam os números de desempenho: `fps` da tela, `mão N Hz` (resultados de rastreamento por segundo), o custo em milissegundos de cada quadro rastreado e onde as redes estão rodando (`CPU` ou `GPU`).
+
+O botão **CPU ⇄ GPU** troca o processador do rastreamento. O padrão é a CPU. Em alguns aparelhos a GPU é bem mais rápida; em GPU fraca ela é mais lenta e ainda pode tirar fps do desenho. Teste e compare os números: se o `ms` cair e o `fps` não, fique na GPU. Se a GPU não puder ser usada, o app volta para a CPU sozinho. A escolha não é guardada entre execuções.
 
 ## Como o rastreamento foi pensado para celular fraco
 
-- **A tela nunca espera a mão.** O rastreamento roda em uma thread própria, com prioridade abaixo da de desenho, e só publica o resultado mais recente. O desenho lê esse resultado sem bloquear. Se a inferência ficar lenta, cai o `Hz` da mão, não o `fps`.
-- **Inferência na CPU (XNNPACK), GPU só para desenhar.** Em GPU fraca, dividir a GPU com o modelo derruba o fps.
+- **A tela nunca espera a mão.** O rastreamento roda em uma thread própria, com prioridade logo abaixo da de desenho e acima do resto do app, e só publica o resultado mais recente. O desenho lê esse resultado sem bloquear. Se a inferência ficar lenta, cai o `Hz` da mão, não o `fps`.
+- **Inferência na CPU (XNNPACK) por padrão, GPU só para desenhar.** Em GPU fraca, dividir a GPU com o modelo derruba o fps; por isso a GPU é opcional (botão **CPU ⇄ GPU**).
+- **Nenhuma cópia de imagem no caminho.** O quadro da câmera vai direto para o MediaPipe, sem bitmap e sem cópia girada: a rotação é só um parâmetro do recorte que o MediaPipe já faz.
+- **Modelo carregado na abertura.** O modelo é carregado enquanto a câmera abre, não no primeiro quadro.
 - **Sempre o quadro mais novo.** A análise usa `STRATEGY_KEEP_ONLY_LATEST`: quadros nunca entram em fila, então o resultado nunca descreve uma imagem velha.
 - **Modo VIDEO do MediaPipe.** O detector de palma só roda quando a mão é perdida; com a mão em cena roda apenas a rede de 21 pontos.
-- **Uma mão, entrada de 640×480.** O MediaPipe recorta a mão para 224 px; mandar mais resolução custa tempo sem ganhar precisão.
+- **Uma mão, entrada de 640×480.** O MediaPipe recorta a mão para 224 px; mandar mais resolução custa tempo sem ganhar precisão. O quadro inteiro do sensor é usado, então a mão continua rastreada mesmo um pouco fora da tela.
 - **Sem mão em cena, a busca cai para ~15 vezes por segundo**, para o aparelho não esquentar à toa. Com a mão rastreada, todos os quadros da câmera são usados.
 - **Nada de previsão nem compensação de atraso.** Não há extrapolação de posição, nem janela de média, nem “unlag”. Os únicos tratamentos são:
-  - filtro One Euro por ponto: tira o tremor com a mão parada e praticamente desliga quando ela se move (atraso abaixo de 8 ms em movimento rápido, coberto por teste);
-  - histerese na pinça (fecha abaixo de 0,30 e abre acima de 0,45 do tamanho da mão, medido nos pontos 3D), para a pinça não piscar;
-  - o desenho se aproxima do resultado mais novo em uma fração do intervalo entre resultados, só para o movimento não “pular” entre um resultado e outro.
+  - filtro One Euro por ponto: tira o tremor com a mão parada e praticamente desliga quando ela se move. Uma mão que sai do repouso de repente é seguida com erro de até uns 2% do tamanho dela (coberto por teste);
+  - histerese na pinça, medida nos pontos 3D (fecha abaixo de 0,30 e abre acima de 0,45 do tamanho da mão). Uma leitura clara muda o estado na hora; uma leitura no limite precisa se repetir no resultado seguinte, para a pinça não piscar;
+  - quando o rastreamento acompanha a câmera (22 resultados por segundo ou mais), cada resultado vai para a tela como chegou. Só abaixo disso o desenho se aproxima do resultado mais novo em 10 a 30 ms, para o movimento não “pular”.
 - **Desenho leve:** OpenGL ES 2.0, iluminação por vértice, geometria em buffers na GPU, superfície limitada a 720 px de largura, nenhuma alocação por quadro.
 - **APK só com `armeabi-v7a` e `arm64-v8a`.**
 

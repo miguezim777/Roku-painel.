@@ -135,6 +135,7 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
     private var statusKey = -1
     private var noticeUntilNs = 0L
     @Volatile private var trackerError: String? = null
+    private val pendingNotice = AtomicReference<String?>(null)
     private var statsStartNs = 0L
     private var statsFrames = 0
 
@@ -146,6 +147,9 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
     }
 
     fun setTrackerError(message: String) { trackerError = message }
+
+    /** Shows a passing message. Can be called from any thread. */
+    fun showNotice(message: String) { pendingNotice.set(message) }
 
     private fun accept(p: PendingStream) {
         val ids = IntArray(1); glGenTextures(1, ids, 0)
@@ -204,7 +208,7 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         // Above the tracking threads, so inference can never take the frame rate down with it.
-        try { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) } catch (_: Exception) {}
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) } catch (_: Exception) {}
         glClearColor(.05f, .07f, .12f, 1f)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glDisable(GL_CULL_FACE); glDisable(GL_DITHER)
@@ -258,12 +262,19 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
                 System.arraycopy(sample.points, 0, display, 0, display.size)
                 handShown = true
             } else {
-                // Results arrive slower than frames are drawn. Easing towards the newest result
-                // over a fraction of the gap between results keeps motion fluid; it is not a
-                // smoothing window and never holds a result back.
-                val tau = (tracker.intervalMs * .0004f).coerceIn(.008f, .040f)
-                val k = 1f - exp(-dt / tau)
-                for (i in display.indices) display[i] += (sample.points[i] - display[i]) * k
+                val interval = tracker.intervalMs
+                if (interval <= SNAP_INTERVAL_MS) {
+                    // The tracker keeps up with the camera: every result goes to the screen as it
+                    // is, in step with the picture, with nothing in between.
+                    System.arraycopy(sample.points, 0, display, 0, display.size)
+                } else {
+                    // Results arrive much slower than frames are drawn. Closing in on the newest
+                    // one over a quarter of the gap keeps motion from jumping; it is not a
+                    // smoothing window and never holds a result back.
+                    val tau = (interval * .00025f).coerceIn(.010f, .030f)
+                    val k = 1f - exp(-dt / tau)
+                    for (i in display.indices) display[i] += (sample.points[i] - display[i]) * k
+                }
             }
             handLostFor = 0f
             cursorX = (display[8] + display[16]) * .5f * width
@@ -629,6 +640,7 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
     }
 
     private fun updateStatus(cameraOn: Boolean, now: Long) {
+        pendingNotice.getAndSet(null)?.let { notice(it) }
         if (now < noticeUntilNs) return
         val error = trackerError
         val hand = handShown || (pointerActive && !pointerFromHand)
@@ -656,7 +668,8 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
         val fps = (statsFrames * 1e9f / elapsed).roundToInt()
         val interval = tracker.intervalMs
         val rate = if (interval > 0f) (1000f / interval).roundToInt() else 0
-        callbacks.stats("$fps fps · mão $rate Hz · ${tracker.frameCostMs.roundToInt()} ms")
+        val where = if (tracker.usingGpu) "GPU" else "CPU"
+        callbacks.stats("$fps fps · mão $rate Hz · ${tracker.frameCostMs.roundToInt()} ms · $where")
         statsStartNs = now; statsFrames = 0
     }
 
@@ -734,6 +747,8 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
         const val HAND_REACH = 1.3f
         const val HAND_GRACE_SECONDS = .30f
         const val STALE_HAND_NS = 700_000_000L
+        /** Up to this many milliseconds between results, results are shown without any easing. */
+        const val SNAP_INTERVAL_MS = 45f
         const val NOTICE_NS = 2_500_000_000L
     }
 }

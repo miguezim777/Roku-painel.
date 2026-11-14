@@ -83,7 +83,7 @@ class HandMathTest {
 
     // ------------------------------------------------------------ one euro filter
 
-    private fun filter() = OneEuroFilter(1.2f, 12f, 1f)
+    private fun filter() = OneEuroFilter(1.2f, 20f, 2f)
 
     /** Steady lag, in seconds, behind an input moving at [speed] units per second. */
     private fun lagSeconds(speed: Float): Float {
@@ -100,8 +100,8 @@ class HandMathTest {
 
     @Test fun fastMotionIsFollowedAlmostWithoutLag() {
         val fast = lagSeconds(3f); val slow = lagSeconds(.2f)
-        assertTrue("fast lag $fast s", fast < .008f)
-        assertTrue("slow lag $slow s", slow > .020f && slow < .080f)
+        assertTrue("fast lag $fast s", fast < .005f)
+        assertTrue("slow lag $slow s", slow > .015f && slow < .060f)
     }
 
     @Test fun jitterOfAStillHandIsRemoved() {
@@ -112,6 +112,17 @@ class HandMathTest {
             if (i > 100) { low = min(low, out); high = max(high, out) }
         }
         assertTrue("left ${high - low} of 0.004", high - low < .004f * .3f)
+    }
+
+    @Test fun handThatStartsMovingIsFollowedClosely() {
+        // At rest, then suddenly 6 hand sizes per second: the worst case for an adaptive filter.
+        for (rate in intArrayOf(15, 30)) {
+            val f = filter(); val dt = 1f / rate
+            repeat(rate) { f.filter(0f, dt, 1f) }
+            var x = 0f; var worst = 0f
+            repeat(rate / 2) { x += 6f * dt; worst = max(worst, x - f.filter(x, dt, 1f)) }
+            assertTrue("behind by $worst hand sizes at $rate Hz", worst < .03f)
+        }
     }
 
     @Test fun filterRestartsAfterReset() {
@@ -135,6 +146,27 @@ class HandMathTest {
         assertFalse(p.pinched)
         repeat(10) { p.update(.40f) }
         assertFalse(p.pinched)
+    }
+
+    @Test fun clearPinchRegistersOnTheFirstReading() {
+        val p = PinchDetector()
+        repeat(5) { p.update(.7f) }
+        assertTrue(p.update(.15f))
+        // A reading that only just crosses the threshold still has to be confirmed.
+        val q = PinchDetector()
+        repeat(5) { q.update(.7f) }
+        assertFalse(q.update(.27f))
+        assertTrue(q.update(.27f))
+    }
+
+    @Test fun openHandReleasesAtOnce() {
+        val p = PinchDetector()
+        p.update(.1f)
+        assertFalse(p.update(.65f))
+        // Only just past the threshold: released on the second reading.
+        p.update(.1f)
+        assertTrue(p.update(.5f))
+        assertFalse(p.update(.5f))
     }
 
     @Test fun oneNoisyReadingDoesNotOpenAPinch() {
@@ -195,45 +227,45 @@ class HandMathTest {
         assertArrayEquals(fullTexture, range, 0f)
     }
 
-    // ------------------------------------------------------------ tracker input
+    // ------------------------------------------------------------ tracker landmarks
 
-    private fun mapping(rotation: Int, mirror: Boolean, margin: Float = .15f, maxSide: Int = 640) =
-        AnalysisMapping().also { assertTrue(it.update(640, 480, 0, 96, 640, 384, rotation, mirror, margin, maxSide)) }
-
-    @Test fun trackerGetsTheVisibleAreaPlusMarginUpright() {
-        val m = mapping(90, false)
-        assertEquals(0, m.regionLeft); assertEquals(640, m.regionRight)
-        assertEquals(53, m.regionTop); assertEquals(427, m.regionBottom)
-        assertEquals(374, m.outputWidth); assertEquals(640, m.outputHeight)
-        assertFalse(m.downscaled)
-        // out x = 427 - buffer y, out y = buffer x
-        assertArrayEquals(floatArrayOf(0f, -1f, 427f, 1f, 0f, 0f, 0f, 0f, 1f), m.bitmapMatrix, 1e-4f)
-        assertFalse(m.update(640, 480, 0, 96, 640, 384, 90, false, .15f, 640))
-    }
+    private fun mapping(rotation: Int, mirror: Boolean) =
+        BufferMapping().also { it.update(640, 480, 0, 96, 640, 384, rotation, mirror) }
 
     @Test fun landmarksLandOnTheScreenWhereTheHandIsShown() {
+        // Back camera in portrait: the buffer is upright after a quarter turn clockwise, and the
+        // screen shows its rows 96..384.
         val m = mapping(90, false)
         assertEquals(.5f, m.viewX(.5f, .5f), 1e-5f); assertEquals(.5f, m.viewY(.5f, .5f), 1e-5f)
-        // The left margin of the tracker image is off screen to the left.
-        assertEquals(-43f / 288f, m.viewX(0f, 0f), 1e-4f); assertEquals(0f, m.viewY(0f, 0f), 1e-5f)
-        assertEquals(1f + 43f / 288f, m.viewX(1f, 1f), 1e-4f); assertEquals(1f, m.viewY(1f, 1f), 1e-5f)
-        // The front camera is shown as a mirror.
-        val front = mapping(270, true)
-        assertEquals(1f + 43f / 288f, front.viewX(0f, 0f), 1e-4f)
-        assertEquals(.5f, front.viewX(.5f, .5f), 1e-5f)
+        // The left end of the buffer is the top of the screen; row 384 is the left screen edge.
+        assertEquals(0f, m.viewX(0f, 384f / 480f), 1e-5f); assertEquals(0f, m.viewY(0f, 384f / 480f), 1e-5f)
+        assertEquals(1f, m.viewX(1f, 96f / 480f), 1e-5f); assertEquals(1f, m.viewY(1f, 96f / 480f), 1e-5f)
+        // Rows outside the crop are off screen, and still tracked.
+        assertEquals(-96f / 288f, m.viewX(.3f, 1f), 1e-5f)
+        assertEquals(1f + 96f / 288f, m.viewX(.3f, 0f), 1e-5f)
     }
 
-    @Test fun largeFramesAreReducedToTheInputLimit() {
-        val m = AnalysisMapping()
-        m.update(1280, 960, 0, 192, 1280, 768, 90, false, 0f, 640)
-        assertTrue(m.downscaled)
-        assertEquals(288, m.outputWidth); assertEquals(640, m.outputHeight)
-        assertEquals(.5f, m.viewX(.5f, .5f), 1e-5f)
+    @Test fun frontCameraIsShownAsAMirror() {
+        val plain = mapping(270, false); val mirrored = mapping(270, true)
+        for (p in floatArrayOf(0f, .3f, 1f)) for (q in floatArrayOf(.1f, .5f, .9f)) {
+            assertEquals(1f - plain.viewX(p, q), mirrored.viewX(p, q), 1e-5f)
+            assertEquals(plain.viewY(p, q), mirrored.viewY(p, q), 1e-5f)
+        }
+    }
+
+    @Test fun mappingFollowsTheCameraWhenItChanges() {
+        val m = mapping(90, false)
+        val before = m.viewX(.2f, .4f)
+        m.update(640, 480, 0, 96, 640, 384, 270, true)
+        assertEquals(before, m.viewX(1f - .2f, .4f), 1e-5f)
+        // An empty crop rectangle means the whole buffer.
+        m.update(640, 480, 0, 0, 0, 0, 0, false)
+        assertEquals(.25f, m.viewX(.25f, .75f), 1e-5f); assertEquals(.75f, m.viewY(.25f, .75f), 1e-5f)
     }
 
     /**
      * The picture and the skeleton must agree: a point of the scene shown at some place on screen
-     * by the preview has to be reported at that same place by the tracker mapping, for every
+     * by the preview has to be reported at that same place by the landmark mapping, for every
      * rotation and for both cameras.
      */
     @Test fun skeletonLinesUpWithThePreview() {
@@ -244,21 +276,16 @@ class HandMathTest {
             val pl = if (swap) 0 else 320; val pt = if (swap) 192 else 0
             val pr = 1280 - pl; val pb = 960 - pt
             FrameMapping.previewTexCoords(tex, 1280, 960, pl, pt, pr, pb, rotation, mirror, fullTexture)
-            val m = AnalysisMapping()
-            m.update(640, 480, pl / 2, pt / 2, pr / 2, pb / 2, rotation, mirror, .15f, 640)
+            val m = BufferMapping()
+            m.update(640, 480, pl / 2, pt / 2, pr / 2, pb / 2, rotation, mirror)
             for (u in floatArrayOf(.1f, .5f, .8f)) for (v in floatArrayOf(.2f, .5f, .9f)) {
-                // Texture coordinate the preview shows at view (u, v): bilinear in the four corners.
-                val bottom = v
-                val s = (tex[4] * (1 - u) + tex[6] * u) * (1 - bottom) + (tex[0] * (1 - u) + tex[2] * u) * bottom
-                val t = (tex[5] * (1 - u) + tex[7] * u) * (1 - bottom) + (tex[1] * (1 - u) + tex[3] * u) * bottom
-                // The same scene point in the analysis buffer, in pixels, then in the tracker image.
-                val bx = s * 640f; val by = t * 480f
-                val b = m.bitmapMatrix
-                val nx = (b[0] * bx + b[1] * by + b[2]) / m.outputWidth
-                val ny = (b[3] * bx + b[4] * by + b[5]) / m.outputHeight
+                // Place in the camera buffer that the preview shows at view (u, v): bilinear in the
+                // four corners. The tracker reports a hand there with these same two numbers.
+                val p = (tex[4] * (1 - u) + tex[6] * u) * (1 - v) + (tex[0] * (1 - u) + tex[2] * u) * v
+                val q = (tex[5] * (1 - u) + tex[7] * u) * (1 - v) + (tex[1] * (1 - u) + tex[3] * u) * v
                 val label = "rotation=$rotation mirror=$mirror u=$u v=$v"
-                assertTrue(label, abs(m.viewX(nx, ny) - u) < 2e-3f)
-                assertTrue(label, abs(m.viewY(nx, ny) - v) < 2e-3f)
+                assertTrue(label, abs(m.viewX(p, q) - u) < 1e-4f)
+                assertTrue(label, abs(m.viewY(p, q) - v) < 1e-4f)
             }
         }
     }

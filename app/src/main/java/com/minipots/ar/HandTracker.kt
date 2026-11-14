@@ -1,24 +1,21 @@
 package com.minipots.ar
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
 import android.os.Process
 import android.os.SystemClock
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.ByteBufferImageBuilder
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
+import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import java.nio.ByteBuffer
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 const val HAND_POINTS = 21
@@ -67,21 +64,32 @@ class HandState {
  *    CameraX keeps only the latest frame meanwhile, so frames are never queued and results never
  *    describe an old image. While a hand is tracked every frame is used: no frame skipping, no
  *    resolution switching, no prediction.
+ *  - The camera buffer goes to MediaPipe as it is. Rotation is a parameter of the crop MediaPipe
+ *    makes anyway, so no pixel is touched here: no bitmap, no rotated copy.
  *  - With no hand in view the search for one runs at a reduced rate, so an idle phone stays cool
  *    and keeps its full speed for when the hand comes back.
- *  - Nothing is allocated per frame except the small result objects MediaPipe returns.
+ *  - Nothing is allocated per frame except small wrapper and result objects.
  */
-class HandTracker(context: Context, private val onError: (String) -> Unit) : ImageAnalysis.Analyzer {
+class HandTracker(
+    context: Context,
+    private val onError: (String) -> Unit,
+    private val onNotice: (String) -> Unit,
+) : ImageAnalysis.Analyzer {
     val state = HandState()
 
     /** True for the front camera: the view is mirrored like a mirror, so landmarks are too. */
     @Volatile var mirror = false
     /** Width / height of the view, used to measure distances on screen. */
     @Volatile var viewAspect = 0.5f
-    /** Smoothed cost of one tracked frame (copy + inference) in milliseconds. */
+    /** Smoothed cost of one tracked frame in milliseconds. */
     @Volatile var frameCostMs = 0f
-    /** Smoothed time between two results in milliseconds. */
+    /** Smoothed time between two results while a hand is followed, in milliseconds. */
     @Volatile var intervalMs = 0f
+    /** Asks for the networks to run on the GPU. Falls back to the CPU by itself if that fails. */
+    @Volatile var preferGpu = false
+    /** Where the networks run now. */
+    @Volatile var usingGpu = false
+        private set
 
     private val appContext = context.applicationContext
     private var landmarker: HandLandmarker? = null
@@ -90,13 +98,10 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
     private var errors = 0
     private var prioritySet = false
 
-    private val mapping = AnalysisMapping()
-    private var source: Bitmap? = null
-    private var input: Bitmap? = null
-    private var canvas: Canvas? = null
-    private val matrix = Matrix()
-    private val paint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+    private val mapping = BufferMapping()
     private var tightRows: ByteBuffer? = null
+    private var options: ImageProcessingOptions? = null
+    private var optionsRotation = -1
 
     private val raw = FloatArray(HAND_POINTS * 2)
     private val filtered = FloatArray(HAND_POINTS * 2)
@@ -110,33 +115,45 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
     private var lastRunNs = 0L
     private var lastHandNs = 0L
 
+    /**
+     * Loads the model before the first camera frame arrives, so tracking starts with the camera.
+     * Must run on the analysis thread.
+     */
+    fun prepare() {
+        if (failed || closed) return
+        try {
+            raisePriority()
+            ensureLandmarker()
+        } catch (e: Throwable) {
+            fail(e)
+        }
+    }
+
     override fun analyze(image: ImageProxy) {
-        var returned = false
         try {
             if (failed || closed) return
-            if (!prioritySet) {
-                // Slightly below the render thread: when the CPU is contended the frame rate wins and
-                // tracking takes what is left. The inference threads MediaPipe starts inherit this.
-                prioritySet = true
-                try { Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT + 2 * Process.THREAD_PRIORITY_LESS_FAVORABLE) } catch (_: Exception) {}
-            }
+            raisePriority()
             val startNs = System.nanoTime()
             if (!tracking && startNs - lastHandNs > IDLE_AFTER_NS && startNs - lastRunNs < IDLE_INTERVAL_NS) return
             lastRunNs = startNs
-            val frame = prepareInput(image)
+            val created = ensureLandmarker()
+            val tracker = landmarker ?: return
+
+            val width = image.width; val height = image.height
+            val rotation = image.imageInfo.rotationDegrees
+            val crop = image.cropRect
+            mapping.update(width, height, crop.left, crop.top, crop.right, crop.bottom, rotation, mirror)
             val frameNs = image.imageInfo.timestamp
-            // The pixels are copied: give the buffer back to the camera before the slow part.
-            image.close(); returned = true
-            val firstFrame = landmarker == null
-            val tracker = landmarker ?: createLandmarker().also { landmarker = it }
             val timestampMs = max(lastTimestampMs + 1, SystemClock.uptimeMillis())
             lastTimestampMs = timestampMs
-            val result = tracker.detectForVideo(BitmapImageBuilder(frame).build(), timestampMs)
+            val frame = ByteBufferImageBuilder(frameBuffer(image), width, height, MPImage.IMAGE_FORMAT_RGBA).build()
+            val result = tracker.detectForVideo(frame, processingOptions(rotation), timestampMs)
+
             val nowNs = System.nanoTime()
             val wasTracking = tracking
             publish(result, nowNs, frameNs)
-            if (!firstFrame) {
-                // The first frame also loads the model; it says nothing about the running cost.
+            if (!created) {
+                // A frame that also loaded the model says nothing about the running cost.
                 val cost = (nowNs - startNs) / 1e6f
                 frameCostMs = if (frameCostMs == 0f) cost else frameCostMs + (cost - frameCostMs) * 0.15f
                 // The rate that matters is the one while a hand is followed, not the idle search.
@@ -144,40 +161,78 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
                     val gap = (nowNs - lastResultNs) / 1e6f
                     intervalMs = if (intervalMs == 0f) gap else intervalMs + (gap - intervalMs) * 0.15f
                 }
-                lastResultNs = nowNs
             }
+            lastResultNs = nowNs
             errors = 0
         } catch (e: Throwable) {
-            // Without a tracker nothing can work; a bad frame is only fatal if it keeps happening.
-            if (landmarker == null || ++errors >= MAX_CONSECUTIVE_ERRORS) {
-                failed = true
-                onError("Rastreamento de mão indisponível: ${e.message ?: e.javaClass.simpleName}")
-            }
+            loseHand()
             state.publish(null, false, System.nanoTime())
+            if (usingGpu && landmarker != null) {
+                // The GPU path is optional: give it one more frame, then go back to the CPU.
+                if (++errors >= 2) {
+                    errors = 0; preferGpu = false; closeLandmarker()
+                    onNotice("A GPU falhou neste aparelho. O rastreamento voltou para a CPU.")
+                }
+            } else if (landmarker == null || ++errors >= MAX_CONSECUTIVE_ERRORS) {
+                // Without a tracker nothing can work; a bad frame is only fatal if it keeps happening.
+                fail(e)
+            }
         } finally {
-            if (!returned) image.close()
+            image.close()
         }
     }
 
     /** Must run on the analysis thread (after the camera is unbound). */
     fun close() {
         closed = true
-        try { landmarker?.close() } catch (_: Exception) {}
-        landmarker = null
-        source?.recycle(); source = null
-        input?.recycle(); input = null; canvas = null
+        closeLandmarker()
     }
 
-    private fun createLandmarker(): HandLandmarker {
+    private fun fail(e: Throwable) {
+        failed = true
+        onError("Rastreamento de mão indisponível: ${e.message ?: e.javaClass.simpleName}")
+    }
+
+    /**
+     * Just below the render thread and above everything else in the app: inference gets the fast
+     * cores, and when the CPU is contended the frame rate still wins. The inference threads
+     * MediaPipe starts are created from this thread and inherit its priority.
+     */
+    private fun raisePriority() {
+        if (prioritySet) return
+        prioritySet = true
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) } catch (_: Exception) {}
+    }
+
+    private fun closeLandmarker() {
+        try { landmarker?.close() } catch (_: Exception) {}
+        landmarker = null; usingGpu = false
+    }
+
+    /** Makes sure a tracker of the requested kind exists. Returns true when one was created now. */
+    private fun ensureLandmarker(): Boolean {
+        val gpu = preferGpu
+        if (landmarker != null && gpu == usingGpu) return false
+        closeLandmarker()
+        loseHand()
+        if (gpu) {
+            try {
+                landmarker = createLandmarker(Delegate.GPU); usingGpu = true
+            } catch (e: Throwable) {
+                preferGpu = false
+                onNotice("GPU indisponível neste aparelho. O rastreamento continua na CPU.")
+            }
+        }
+        if (landmarker == null) landmarker = createLandmarker(Delegate.CPU)
+        frameCostMs = 0f; intervalMs = 0f; lastResultNs = 0L
+        return true
+    }
+
+    private fun createLandmarker(delegate: Delegate): HandLandmarker {
         val options = HandLandmarker.HandLandmarkerOptions.builder()
-            .setBaseOptions(
-                BaseOptions.builder()
-                    .setModelAssetPath(MODEL_ASSET)
-                    // CPU (XNNPACK) on purpose: the GPU is left entirely to rendering, so tracking
-                    // cannot lower the frame rate, and weak GPUs are slower at this model anyway.
-                    .setDelegate(Delegate.CPU)
-                    .build()
-            )
+            // CPU (XNNPACK) by default: the GPU is left entirely to rendering, so tracking cannot
+            // lower the frame rate. The GPU is only used when the user asks for it.
+            .setBaseOptions(BaseOptions.builder().setModelAssetPath(MODEL_ASSET).setDelegate(delegate).build())
             // VIDEO mode keeps MediaPipe's own tracking between frames (palm detection only runs
             // when the hand is lost) and returns the result synchronously.
             .setRunningMode(RunningMode.VIDEO)
@@ -189,59 +244,59 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
         return HandLandmarker.createFromOptions(appContext, options)
     }
 
-    /** Copies the visible part of the camera frame, upright, into the reusable input bitmap. */
-    private fun prepareInput(image: ImageProxy): Bitmap {
-        val width = image.width; val height = image.height
-        val crop = image.cropRect
-        val changed = mapping.update(
-            width, height, crop.left, crop.top, crop.right, crop.bottom,
-            image.imageInfo.rotationDegrees, mirror, OFFSCREEN_MARGIN, MAX_INPUT_SIDE,
-        )
-        var src = source
-        if (src == null || src.width != width || src.height != height) {
-            src?.recycle()
-            src = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888); source = src
-        }
-        var dst = input
-        if (changed || dst == null || dst.width != mapping.outputWidth || dst.height != mapping.outputHeight) {
-            dst?.recycle()
-            dst = Bitmap.createBitmap(mapping.outputWidth, mapping.outputHeight, Bitmap.Config.ARGB_8888); input = dst
-            canvas = Canvas(dst)
-            matrix.setValues(mapping.bitmapMatrix)
-            paint.isFilterBitmap = mapping.downscaled
-        }
+    /** The clockwise rotation that makes the buffer upright, as MediaPipe wants to be told. */
+    private fun processingOptions(rotation: Int): ImageProcessingOptions {
+        val current = options
+        if (current != null && optionsRotation == rotation) return current
+        val created = ImageProcessingOptions.builder().setRotationDegrees(rotation).build()
+        options = created; optionsRotation = rotation
+        return created
+    }
 
+    /**
+     * The RGBA pixels of [image] as MediaPipe accepts them: a direct buffer of exactly
+     * width * height * 4 bytes. Normally that is the camera buffer itself, without a copy.
+     */
+    private fun frameBuffer(image: ImageProxy): ByteBuffer {
         val plane = image.planes[0]
         val pixels = plane.buffer
-        val rowBytes = width * 4
-        if (plane.rowStride == rowBytes) {
-            pixels.rewind()
-            src.copyPixelsFromBuffer(pixels)
-        } else {
-            // Rows are padded on this device: pack them first.
-            val tight = tightRows?.takeIf { it.capacity() == rowBytes * height }
-                ?: ByteBuffer.allocateDirect(rowBytes * height).also { tightRows = it }
-            tight.clear()
-            for (y in 0 until height) {
-                pixels.limit(y * plane.rowStride + rowBytes)
-                pixels.position(y * plane.rowStride)
-                tight.put(pixels)
-            }
-            tight.rewind()
-            src.copyPixelsFromBuffer(tight)
+        val rowBytes = image.width * 4
+        val size = rowBytes * image.height
+        if (pixels.isDirect && plane.rowStride == rowBytes && pixels.capacity() >= size) {
+            if (pixels.capacity() == size) return pixels
+            pixels.position(0); pixels.limit(size)
+            return pixels.slice()
         }
-        canvas!!.drawBitmap(src, matrix, paint)
-        return dst
+        // Rows are padded on this device: pack them.
+        val tight = tightRows?.takeIf { it.capacity() == size }
+            ?: ByteBuffer.allocateDirect(size).also { tightRows = it }
+        tight.clear()
+        val capacity = pixels.capacity()
+        for (y in 0 until image.height) {
+            val start = y * plane.rowStride
+            pixels.limit(min(capacity, start + rowBytes))
+            pixels.position(min(capacity, start))
+            tight.put(pixels)
+        }
+        tight.rewind()
+        return tight
+    }
+
+    private fun loseHand() {
+        if (!tracking) return
+        tracking = false; pinch.reset()
+        for (f in filters) f.reset()
     }
 
     private fun publish(result: HandLandmarkerResult, nowNs: Long, frameNs: Long) {
         val hands = result.landmarks()
         val worlds = result.worldLandmarks()
         if (hands.isEmpty() || hands[0].size < HAND_POINTS) {
-            if (tracking) { tracking = false; pinch.reset(); for (f in filters) f.reset() }
+            loseHand()
             state.publish(null, false, nowNs)
             return
         }
+        // Landmarks come normalized to the buffer as the sensor delivers it.
         val hand = hands[0]
         for (i in 0 until HAND_POINTS) {
             val p = hand[i]; val x = p.x(); val y = p.y()
@@ -291,12 +346,11 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
         /** After this long without a hand, look for one only every [IDLE_INTERVAL_NS]. */
         const val IDLE_AFTER_NS = 1_500_000_000L
         const val IDLE_INTERVAL_NS = 60_000_000L
-        /** Share of the visible area kept around it so a hand leaving the screen keeps tracking. */
-        const val OFFSCREEN_MARGIN = 0.15f
-        /** The tracker crops the hand to 224 px itself; more input than this adds cost, not accuracy. */
-        const val MAX_INPUT_SIDE = 640
+        // One Euro filter, with speed in hand sizes per second. Chosen by simulation at 15 and 30
+        // results per second: a still hand keeps 40% of its jitter, and a hand that starts moving
+        // is followed within about 2% of its own size, at any speed.
         const val MIN_CUTOFF_HZ = 1.2f
-        const val BETA = 12f
-        const val DERIVATIVE_CUTOFF_HZ = 1f
+        const val BETA = 20f
+        const val DERIVATIVE_CUTOFF_HZ = 2f
     }
 }

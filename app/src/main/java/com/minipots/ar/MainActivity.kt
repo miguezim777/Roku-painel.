@@ -61,8 +61,10 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN
 
         analysisExecutor = Executors.newSingleThreadExecutor { Thread(it, "hand-tracking") }
-        tracker = HandTracker(this) { message -> renderer.setTrackerError(message) }
+        tracker = HandTracker(this, { message -> renderer.setTrackerError(message) }, { message -> renderer.showNotice(message) })
         renderer = RoomRenderer(tracker, this)
+        // The model loads while the camera opens, instead of on the first frame.
+        analysisExecutor.execute { tracker.prepare() }
         surface = GLSurfaceView(this).apply {
             preserveEGLContextOnPause = true
             setEGLContextClientVersion(2)
@@ -123,7 +125,8 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
         row("Tampa" to { command { toggleLid() } }, "Cor" to { command { changeColor() } }, "−" to { command { resize(0.85f) } },
             "+" to { command { resize(1.18f) } }, "Girar ↻" to { command { rotateSelected() } },
             "Retirar" to { command { removeItem() } }, "Excluir" to { command { deleteSelected() } },
-            "Câmera ⟲" to { switchCamera() })
+            "Câmera ⟲" to { switchCamera() },
+            "CPU ⇄ GPU" to { switchProcessor() })
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1, Gravity.TOP))
         // Only controls consume touches; the transparent overlay otherwise forwards to the camera view.
         overlay.isClickable = false
@@ -177,6 +180,20 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
     private fun switchCamera() {
         frontCamera = !frontCamera
         bindCamera()
+    }
+
+    /**
+     * Moves the tracking networks between CPU and GPU. Which one is faster depends on the phone;
+     * the numbers at the top right show the result. The tracker returns to the CPU by itself if
+     * the GPU cannot be used.
+     */
+    private fun switchProcessor() {
+        val gpu = !tracker.preferGpu
+        tracker.preferGpu = gpu
+        renderer.showNotice(
+            if (gpu) "Testando o rastreamento na GPU… Compare os números no canto: se o fps cair, volte para a CPU."
+            else "Rastreamento na CPU."
+        )
     }
 
     private fun bindCamera() {

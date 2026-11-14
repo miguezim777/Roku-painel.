@@ -5,7 +5,6 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
@@ -181,18 +180,32 @@ class OneEuroFilter(private val minCutoff: Float, private val beta: Float, priva
 /**
  * Pinch (thumb tip touching index tip) with hysteresis. [update] takes the tip distance divided
  * by the hand size, so the result does not depend on how far the hand is from the camera.
+ *
+ * A clear reading changes the state at once. A reading that only just crosses a threshold has to
+ * be repeated on the next result, so tracking noise cannot make the pinch flicker.
  */
 class PinchDetector(private val closeBelow: Float = 0.30f, private val openAbove: Float = 0.45f) {
     var pinched = false
         private set
-    private var smoothed = -1f
+    private var streak = 0
 
-    fun reset() { pinched = false; smoothed = -1f }
+    fun reset() { pinched = false; streak = 0 }
 
     fun update(ratio: Float): Boolean {
-        smoothed = if (smoothed < 0f) ratio else smoothed + (ratio - smoothed) * 0.65f
-        pinched = if (pinched) smoothed < openAbove else smoothed < closeBelow
+        if (pinched) {
+            streak = if (ratio > openAbove) streak + 1 else 0
+            if (ratio > openAbove * CLEARLY_OPEN || streak >= CONFIRMATIONS) { pinched = false; streak = 0 }
+        } else {
+            streak = if (ratio < closeBelow) streak + 1 else 0
+            if (ratio < closeBelow * CLEARLY_CLOSED || streak >= CONFIRMATIONS) { pinched = true; streak = 0 }
+        }
         return pinched
+    }
+
+    private companion object {
+        const val CLEARLY_CLOSED = 0.75f
+        const val CLEARLY_OPEN = 1.3f
+        const val CONFIRMATIONS = 2
     }
 }
 
@@ -249,94 +262,50 @@ object FrameMapping {
 }
 
 /**
- * Plans how an analysis frame is turned into the image given to the hand tracker.
+ * Converts hand landmarks to screen positions.
  *
- * The tracker receives the part of the frame that is visible on screen plus a margin (so a hand
- * that is partly off screen keeps tracking), already upright. The same plan converts the
- * landmarks it returns to normalized view coordinates.
+ * The tracker is given the camera buffer exactly as the sensor delivers it and returns landmarks
+ * normalized to that buffer (p along its x axis, q along its y axis). This maps them to normalized
+ * view coordinates, using the same crop rectangle and rotation the preview is drawn with.
  */
-class AnalysisMapping {
-    /** Region of the buffer that is copied, in buffer pixels. */
-    var regionLeft = 0; private set
-    var regionTop = 0; private set
-    var regionRight = 0; private set
-    var regionBottom = 0; private set
-    /** Size of the upright image given to the tracker. */
-    var outputWidth = 0; private set
-    var outputHeight = 0; private set
-    /** True when the region is drawn smaller than its size in the buffer. */
-    var downscaled = false; private set
-    /** Affine buffer pixel -> output pixel, in android.graphics.Matrix.setValues order. */
-    val bitmapMatrix = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
-
-    // view = origin + ex * nx + ey * ny, for landmarks (nx, ny) normalized to the output image.
-    private var viewX0 = 0f; private var viewXdx = 1f; private var viewXdy = 0f
-    private var viewY0 = 0f; private var viewYdx = 0f; private var viewYdy = 1f
+class BufferMapping {
+    // view = origin + ex * p + ey * q
+    private var viewX0 = 0f; private var viewXdp = 1f; private var viewXdq = 0f
+    private var viewY0 = 0f; private var viewYdp = 0f; private var viewYdq = 1f
 
     private var keyW = -1; private var keyH = -1; private var keyL = -1; private var keyT = -1
     private var keyR = -1; private var keyB = -1; private var keyRot = -1; private var keyMirror = false
 
-    /** Returns true when the plan changed (bitmaps must be recreated). */
     fun update(
         bufferWidth: Int, bufferHeight: Int,
         cropLeft: Int, cropTop: Int, cropRight: Int, cropBottom: Int,
-        rotation: Int, mirror: Boolean, margin: Float, maxSide: Int,
-    ): Boolean {
+        rotation: Int, mirror: Boolean,
+    ) {
         if (bufferWidth == keyW && bufferHeight == keyH && cropLeft == keyL && cropTop == keyT &&
-            cropRight == keyR && cropBottom == keyB && rotation == keyRot && mirror == keyMirror) return false
+            cropRight == keyR && cropBottom == keyB && rotation == keyRot && mirror == keyMirror) return
         keyW = bufferWidth; keyH = bufferHeight; keyL = cropLeft; keyT = cropTop
         keyR = cropRight; keyB = cropBottom; keyRot = rotation; keyMirror = mirror
 
         var cl = cropLeft.coerceIn(0, bufferWidth); var cr = cropRight.coerceIn(0, bufferWidth)
         var ct = cropTop.coerceIn(0, bufferHeight); var cb = cropBottom.coerceIn(0, bufferHeight)
         if (cr - cl < 2 || cb - ct < 2) { cl = 0; ct = 0; cr = bufferWidth; cb = bufferHeight }
-        val mx = ((cr - cl) * margin).roundToInt(); val my = ((cb - ct) * margin).roundToInt()
-        regionLeft = max(0, cl - mx); regionRight = min(bufferWidth, cr + mx)
-        regionTop = max(0, ct - my); regionBottom = min(bufferHeight, cb + my)
-        val rw = (regionRight - regionLeft).toFloat(); val rh = (regionBottom - regionTop).toFloat()
-
-        val scale = min(1f, maxSide / max(rw, rh))
-        downscaled = scale < 0.999f
-        val swap = rotation == 90 || rotation == 270
-        outputWidth = max(1, ((if (swap) rh else rw) * scale).roundToInt())
-        outputHeight = max(1, ((if (swap) rw else rh) * scale).roundToInt())
-
-        // Buffer pixel -> output pixel, from the images of the three region corners.
-        val ox = outX(0f, 0f); val oy = outY(0f, 0f)
-        val sx = (outX(1f, 0f) - ox) / rw; val kx = (outX(0f, 1f) - ox) / rh
-        val ky = (outY(1f, 0f) - oy) / rw; val sy = (outY(0f, 1f) - oy) / rh
-        bitmapMatrix[0] = sx; bitmapMatrix[1] = kx; bitmapMatrix[2] = ox - sx * regionLeft - kx * regionTop
-        bitmapMatrix[3] = ky; bitmapMatrix[4] = sy; bitmapMatrix[5] = oy - ky * regionLeft - sy * regionTop
-        bitmapMatrix[6] = 0f; bitmapMatrix[7] = 0f; bitmapMatrix[8] = 1f
-
-        // Output-normalized landmark -> normalized view position, from three probe points.
-        val cw = (cr - cl).toFloat(); val ch = (cb - ct).toFloat()
-        viewX0 = probeX(0f, 0f, cl, ct, cw, ch, mirror); viewY0 = probeY(0f, 0f, cl, ct, cw, ch)
-        viewXdx = probeX(1f, 0f, cl, ct, cw, ch, mirror) - viewX0; viewYdx = probeY(1f, 0f, cl, ct, cw, ch) - viewY0
-        viewXdy = probeX(0f, 1f, cl, ct, cw, ch, mirror) - viewX0; viewYdy = probeY(0f, 1f, cl, ct, cw, ch) - viewY0
-        return true
+        // Position inside the crop rectangle (0..1 on both axes) of the three buffer corners used
+        // as probes; the mapping is affine, so three points define it.
+        val p0 = -cl.toFloat() / (cr - cl); val p1 = (bufferWidth - cl).toFloat() / (cr - cl)
+        val q0 = -ct.toFloat() / (cb - ct); val q1 = (bufferHeight - ct).toFloat() / (cb - ct)
+        viewX0 = across(p0, q0); viewY0 = FrameMapping.uprightB(rotation, p0, q0)
+        viewXdp = across(p1, q0) - viewX0; viewYdp = FrameMapping.uprightB(rotation, p1, q0) - viewY0
+        viewXdq = across(p0, q1) - viewX0; viewYdq = FrameMapping.uprightB(rotation, p0, q1) - viewY0
     }
 
     /** Normalized view x (0 = left edge of the screen, 1 = right edge) of a tracker landmark. */
-    fun viewX(nx: Float, ny: Float): Float = viewX0 + viewXdx * nx + viewXdy * ny
+    fun viewX(p: Float, q: Float): Float = viewX0 + viewXdp * p + viewXdq * q
 
     /** Normalized view y (0 = top edge of the screen, 1 = bottom edge) of a tracker landmark. */
-    fun viewY(nx: Float, ny: Float): Float = viewY0 + viewYdx * nx + viewYdy * ny
+    fun viewY(p: Float, q: Float): Float = viewY0 + viewYdp * p + viewYdq * q
 
-    private fun outX(p: Float, q: Float) = FrameMapping.uprightA(keyRot, p, q) * outputWidth
-    private fun outY(p: Float, q: Float) = FrameMapping.uprightB(keyRot, p, q) * outputHeight
-
-    private fun cropP(a: Float, b: Float, cl: Int, cw: Float) =
-        (regionLeft + FrameMapping.bufferP(keyRot, a, b) * (regionRight - regionLeft) - cl) / cw
-
-    private fun cropQ(a: Float, b: Float, ct: Int, ch: Float) =
-        (regionTop + FrameMapping.bufferQ(keyRot, a, b) * (regionBottom - regionTop) - ct) / ch
-
-    private fun probeX(a: Float, b: Float, cl: Int, ct: Int, cw: Float, ch: Float, mirror: Boolean): Float {
-        val x = FrameMapping.uprightA(keyRot, cropP(a, b, cl, cw), cropQ(a, b, ct, ch))
-        return if (mirror) 1f - x else x
+    private fun across(p: Float, q: Float): Float {
+        val a = FrameMapping.uprightA(keyRot, p, q)
+        return if (keyMirror) 1f - a else a
     }
-
-    private fun probeY(a: Float, b: Float, cl: Int, ct: Int, cw: Float, ch: Float): Float =
-        FrameMapping.uprightB(keyRot, cropP(a, b, cl, cw), cropQ(a, b, ct, ch))
 }
