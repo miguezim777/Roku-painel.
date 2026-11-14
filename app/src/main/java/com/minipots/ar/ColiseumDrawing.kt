@@ -53,6 +53,7 @@ class ColiseumDrawing {
     private val skyMesh = Mesh(ColiseumScenery.sky(), ColiseumScenery.FLOATS_PER_VERTEX)
     private val ball = Mesh(unitBall(), 6)
     private val cylinder = Mesh(unitCylinder(16), 6)
+    private val taper = Mesh(unitCylinder(16, TAPER), 6)
     private val box = Mesh(unitBox(), 6)
     private val disc = Mesh(unitDisc(20), 6)
 
@@ -128,21 +129,15 @@ class ColiseumDrawing {
     }
 
     /**
-     * A hand: palm, five fingers of three bones each with a ball on every joint, nails, and a short
-     * cuff at the wrist. There is no arm. [j] holds the 21 joints as x, y, z triples in the world,
+     * A hand: palm, five fingers of three bones each with a ball on every joint, nails, and a
+     * rounded wrist for the forearm of [arm] to arrive at. [j] holds the 21 joints as x, y, z triples in the world,
      * [scale] is how many times bigger than a real hand it is, [palmSign] tells which side the palm
      * is on (see [HandReading.palmSign]) and [confidence] goes from 1 to 0 while a hand that is no
      * longer followed is still shown: it fades towards grey. The eye is at ([eyeX], [eyeY], [eyeZ]).
      */
     fun hand(j: FloatArray, scale: Float, palmSign: Float, confidence: Float, eyeX: Float, eyeY: Float, eyeZ: Float) {
         val sure = confidence.coerceIn(0f, 1f)
-        // Soft light from a little above the eyes, so the hand is never a dark shape against the sun.
-        var lx = eyeX - j[27]; var ly = eyeY - j[28] + .6f; var lz = eyeZ - j[29]
-        val ll = max(1e-5f, sqrt(lx * lx + ly * ly + lz * lz)); lx /= ll; ly /= ll; lz /= ll
-        lx = lx * .8f + .45f * .5f; ly = ly * .8f + .50f * .5f; lz = lz * .8f - .74f * .5f
-        val l2 = max(1e-5f, sqrt(lx * lx + ly * ly + lz * lz))
-        glUniform3f(uLight, lx / l2, ly / l2, lz / l2)
-        glUniform4f(uShade, fade(SHADE_R, sure), fade(SHADE_G, sure), fade(SHADE_B, sure), 1f)
+        skinLight(j[27], j[28], j[29], eyeX, eyeY, eyeZ, sure)
         val r = fade(SKIN_R, sure); val g = fade(SKIN_G, sure); val b = fade(SKIN_B, sure)
 
         // The frame of the palm: across it (little finger to index), along it (wrist to knuckles)
@@ -158,22 +153,15 @@ class ColiseumDrawing {
         // Back of the hand: along x across, turned by which hand it is.
         val nx = (py * az - pz * ay) * palmSign; val ny = (pz * ax - px * az) * palmSign; val nz = (px * ay - py * ax) * palmSign
 
-        // Cuff: the wrist goes on a little way towards the arm and ends there, rounded. A wrist
-        // is wider than it is thick.
-        val cuff = .034f * scale; val wide = .0255f * scale; val deep = .0175f * scale
+        // Wrist: a ball where the forearm arrives (see [arm]), and a flatter one that leads into
+        // the palm. A wrist is wider than it is thick.
+        val wide = .0255f * scale; val deep = .0175f * scale
+        globe(j[0], j[1], j[2], .0225f * scale, r, g, b)
         Place.frame(
-            model, ax * wide, ay * wide, az * wide, -px * (cuff + .010f * scale), -py * (cuff + .010f * scale), -pz * (cuff + .010f * scale),
+            model, ax * wide, ay * wide, az * wide, px * deep, py * deep, pz * deep,
             nx * deep, ny * deep, nz * deep, j[0] + px * .010f * scale, j[1] + py * .010f * scale, j[2] + pz * .010f * scale,
         )
-        draw(cylinder, model, r, g, b, 1f, 1f)
-        for (end in 0..1) {
-            val back = if (end == 0) cuff else -.010f * scale
-            Place.frame(
-                model, ax * wide * 1.02f, ay * wide * 1.02f, az * wide * 1.02f, px * deep, py * deep, pz * deep,
-                nx * deep * 1.02f, ny * deep * 1.02f, nz * deep * 1.02f, j[0] - px * back, j[1] - py * back, j[2] - pz * back,
-            )
-            draw(ball, model, r, g, b, 1f, 1f)
-        }
+        draw(ball, model, r, g, b, 1f, 1f)
 
         // Palm: an oval slab between wrist and knuckles, and the bones of the palm inside it.
         val halfAcross = across * .60f; val halfAlong = along * .58f; val thick = .0125f * scale
@@ -233,6 +221,43 @@ class ColiseumDrawing {
             draw(ball, model, fade(NAIL_R, sure), fade(NAIL_G, sure), fade(NAIL_B, sure), 1f, 1f)
         }
         glUniform4f(uShade, 0f, 0f, 0f, 0f)
+    }
+
+    /**
+     * The arm of a hand: upper arm from the shoulder to the elbow and forearm from the elbow to the
+     * wrist, each thinner towards its far end, with a ball on the shoulder and on the elbow. The
+     * points are x, y, z triples starting at [offset] of [shoulders] and [elbows]; the wrist is
+     * ([wx], [wy], [wz]). [scale] and [confidence] are those of the hand it ends in.
+     */
+    fun arm(
+        shoulders: FloatArray, elbows: FloatArray, offset: Int, wx: Float, wy: Float, wz: Float,
+        scale: Float, confidence: Float, eyeX: Float, eyeY: Float, eyeZ: Float,
+    ) {
+        val sure = confidence.coerceIn(0f, 1f)
+        val sx = shoulders[offset]; val sy = shoulders[offset + 1]; val sz = shoulders[offset + 2]
+        val ex = elbows[offset]; val ey = elbows[offset + 1]; val ez = elbows[offset + 2]
+        skinLight(ex, ey, ez, eyeX, eyeY, eyeZ, sure)
+        val r = fade(SKIN_R, sure); val g = fade(SKIN_G, sure); val b = fade(SKIN_B, sure)
+        // The forearm arrives at the wrist as thick as the wrist of the hand is.
+        val wrist = .0215f * scale; val elbow = wrist / TAPER; val shoulder = elbow / TAPER
+        Place.between(model, sx, sy, sz, ex, ey, ez, shoulder); draw(taper, model, r, g, b, 1f, 1f)
+        Place.between(model, ex, ey, ez, wx, wy, wz, elbow); draw(taper, model, r, g, b, 1f, 1f)
+        globe(sx, sy, sz, shoulder * 1.02f, r, g, b)
+        globe(ex, ey, ez, elbow * 1.02f, r, g, b)
+        glUniform4f(uShade, 0f, 0f, 0f, 0f)
+    }
+
+    /**
+     * Sets the light for skin around ([x], [y], [z]): soft, from a little above the eyes, so skin
+     * is never a dark shape against the sun. [sure] fades the shade colour to grey with the rest.
+     */
+    private fun skinLight(x: Float, y: Float, z: Float, eyeX: Float, eyeY: Float, eyeZ: Float, sure: Float) {
+        var lx = eyeX - x; var ly = eyeY - y + .6f; var lz = eyeZ - z
+        val ll = max(1e-5f, sqrt(lx * lx + ly * ly + lz * lz)); lx /= ll; ly /= ll; lz /= ll
+        lx = lx * .8f + .45f * .5f; ly = ly * .8f + .50f * .5f; lz = lz * .8f - .74f * .5f
+        val l2 = max(1e-5f, sqrt(lx * lx + ly * ly + lz * lz))
+        glUniform3f(uLight, lx / l2, ly / l2, lz / l2)
+        glUniform4f(uShade, fade(SHADE_R, sure), fade(SHADE_G, sure), fade(SHADE_B, sure), 1f)
     }
 
     /** A colour on its way to grey as the hand is less sure. */
@@ -354,6 +379,8 @@ class ColiseumDrawing {
         const val NAIL_G = 0xB7 / 255f
         const val NAIL_B = 0xA0 / 255f
         /** Bones inside the palm: from the wrist to the base of each finger, and along the knuckles. */
+        /** How much thinner the far end of each bone of the arm is than its near end. */
+        const val TAPER = .82f
         val PALM_BONES = intArrayOf(0, 1, 0, 5, 0, 9, 0, 13, 0, 17, 5, 9, 9, 13, 13, 17)
     }
 }
@@ -378,7 +405,7 @@ private fun unitBall(): FloatArray {
 }
 
 /** Cylinder of radius 1 standing on the origin, from y = 0 to y = 1, closed at both ends. */
-private fun unitCylinder(sides: Int): FloatArray {
+private fun unitCylinder(sides: Int, top: Float = 1f): FloatArray {
     val out = FloatArray(sides * 12 * 6)
     var n = 0
     fun put(x: Float, y: Float, z: Float, nx: Float, ny: Float, nz: Float) {
@@ -387,10 +414,11 @@ private fun unitCylinder(sides: Int): FloatArray {
     for (i in 0 until sides) {
         val a = 2f * PI.toFloat() * i / sides; val c = 2f * PI.toFloat() * (i + 1) / sides
         val x0 = cos(a); val z0 = sin(a); val x1 = cos(c); val z1 = sin(c)
-        // Smooth sides: each corner has the normal of its own direction.
-        put(x0, 0f, z0, x0, 0f, z0); put(x1, 0f, z1, x1, 0f, z1); put(x1, 1f, z1, x1, 0f, z1)
-        put(x0, 0f, z0, x0, 0f, z0); put(x1, 1f, z1, x1, 0f, z1); put(x0, 1f, z0, x0, 0f, z0)
-        put(0f, 1f, 0f, 0f, 1f, 0f); put(x0, 1f, z0, 0f, 1f, 0f); put(x1, 1f, z1, 0f, 1f, 0f)
+        // Smooth sides: each corner has the normal of its own direction. [top] is the radius at
+        // the far end; the slope it gives is too slight to matter to the light.
+        put(x0, 0f, z0, x0, 0f, z0); put(x1, 0f, z1, x1, 0f, z1); put(x1 * top, 1f, z1 * top, x1, 0f, z1)
+        put(x0, 0f, z0, x0, 0f, z0); put(x1 * top, 1f, z1 * top, x1, 0f, z1); put(x0 * top, 1f, z0 * top, x0, 0f, z0)
+        put(0f, 1f, 0f, 0f, 1f, 0f); put(x0 * top, 1f, z0 * top, 0f, 1f, 0f); put(x1 * top, 1f, z1 * top, 0f, 1f, 0f)
         put(0f, 0f, 0f, 0f, -1f, 0f); put(x1, 0f, z1, 0f, -1f, 0f); put(x0, 0f, z0, 0f, -1f, 0f)
     }
     return out

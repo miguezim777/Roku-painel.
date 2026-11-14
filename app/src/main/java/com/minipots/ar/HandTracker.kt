@@ -83,8 +83,9 @@ class HandState {
  * for a second hand is the expensive part of tracking (it runs the palm detector on the whole
  * picture), and MediaPipe does it on every frame for as long as fewer hands are followed than it
  * was asked for. So on the CPU two trackers are kept: one that follows a single hand, which is
- * used while one hand is in view, and one for two hands, which is used while two are in view and
- * otherwise only a few times a second, to see whether the other hand has come back.
+ * used while one hand is in view, and one for two hands, which is used while two are in view or
+ * none is, and otherwise only now and then, to see whether the other hand has come back
+ * ([TrackerChoice] decides).
  */
 class HandTracker(
     context: Context,
@@ -149,9 +150,7 @@ class HandTracker(
     private var landmarker: HandLandmarker? = null
     /** Follows one hand only; see the class comment. Null on the GPU and when one hand is all that is wanted. */
     private var single: HandLandmarker? = null
-    private var pairMode = false
-    private var lastPairNs = 0L
-    private var lastProbeNs = 0L
+    private val choice = TrackerChoice()
     private var lastArrivalNs = 0L
     private val slots = HandSlots()
     private val frame = HandsFrame()
@@ -308,7 +307,7 @@ class HandTracker(
         try { landmarker?.close() } catch (_: Exception) {}
         try { single?.close() } catch (_: Exception) {}
         landmarker = null; single = null; usingGpu = false
-        pairMode = false; inferenceMs = 0f
+        choice.reset(); inferenceMs = 0f
         // Whatever was measured belongs to the tracker that is gone.
         trackedFrames = 0; trackedCostMs = 0f; warmUp = 0; gpuFrames = 0
         frameCostMs = 0f; intervalMs = 0f; lastResultNs = 0L
@@ -335,15 +334,10 @@ class HandTracker(
         return true
     }
 
-    /**
-     * The tracker for this frame: the one for a single hand while one hand or none is in view,
-     * with a look for the second hand every [PROBE_NS]; the one for two hands while both are.
-     */
+    /** The tracker for this frame: the one for two hands or the one for a single hand (see [TrackerChoice]). */
     private fun chooseLandmarker(nowNs: Long): HandLandmarker? {
         val one = single ?: return landmarker
-        if (pairMode) return landmarker
-        if (tracking && nowNs - lastProbeNs >= PROBE_NS) { lastProbeNs = nowNs; return landmarker }
-        return one
+        return if (choice.forTwo(nowNs)) landmarker else one
     }
 
     /** The model asked for, or the full one when the APK was built without the lighter one. */
@@ -366,9 +360,12 @@ class HandTracker(
             // when the hand is lost) and returns the result synchronously.
             .setRunningMode(RunningMode.VIDEO)
             .setNumHands(count)
+            // Finding a hand stays as strict as it was, so nothing else is taken for one. Keeping a
+            // hand that is already followed is more lenient when both hands are wanted: a blurred
+            // frame of a fast hand then keeps it instead of starting the search again.
             .setMinHandDetectionConfidence(0.5f)
-            .setMinHandPresenceConfidence(0.5f)
-            .setMinTrackingConfidence(0.5f)
+            .setMinHandPresenceConfidence(if (hands >= 2) KEEP_CONFIDENCE else 0.5f)
+            .setMinTrackingConfidence(if (hands >= 2) KEEP_CONFIDENCE else 0.5f)
             .build()
         return HandLandmarker.createFromOptions(appContext, options)
     }
@@ -479,13 +476,10 @@ class HandTracker(
         frames.publish(frame)
         handsInView = count
 
-        if (count > 0) { lastHandNs = nowNs; tracking = true } else { tracking = false; slots.reset() }
-        // Two hands in view: stay with the tracker for two. One of them gone for a while: back to
-        // the cheap one.
-        if (single != null) {
-            if (count >= 2 && used === landmarker) { pairMode = true; lastPairNs = nowNs }
-            else if (pairMode && nowNs - lastPairNs > PAIR_HOLD_NS) { pairMode = false; lastProbeNs = nowNs }
-        }
+        // An empty frame does not make the slots forget which hand was where: changing from one
+        // tracker to the other costs an empty frame, and [HandSlots] forgets by itself in time.
+        if (count > 0) { lastHandNs = nowNs; tracking = true } else tracking = false
+        if (single != null) choice.result(used === landmarker, count, nowNs)
     }
 
     private fun publish(result: HandLandmarkerResult, nowNs: Long, frameNs: Long) {
@@ -566,10 +560,8 @@ class HandTracker(
         /** Focal length of a typical phone camera in units of the long side of its picture. */
         const val DEFAULT_FOCAL = .77f
         private const val MODEL_ASSET = "hand_landmarker.task"
-        /** While one hand is followed, the other one is looked for this often. */
-        private const val PROBE_NS = 350_000_000L
-        /** With two hands followed, one may be missing this long before the cheap tracker takes over. */
-        private const val PAIR_HOLD_NS = 400_000_000L
+        /** How sure the tracker has to be that a hand it follows is still a hand. Not measured on a phone. */
+        private const val KEEP_CONFIDENCE = 0.35f
         private const val MAX_CONSECUTIVE_ERRORS = 5
         private const val WARM_UP_FRAMES = 5
         private const val MEAN_WINDOW = 200

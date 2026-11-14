@@ -1,9 +1,11 @@
 package com.minipots.ar
 
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 // What the coliseum needs to be played inside phone goggles, in pure Kotlin with no Android
@@ -312,7 +314,8 @@ object HandGeometry {
  *    through;
  *  - between two readings the hand keeps moving the way it was, for a bounded short time;
  *  - when readings stop, the last pose is kept while [confidence] falls, and after [HOLD_SECONDS]
- *    the hand is [State.LOST]: it is never shown as if it were still followed.
+ *    (longer when readings come slowly) the hand is [State.LOST]: it is never shown as if it were
+ *    still followed.
  */
 class HandRig {
     enum class State { LOST, TRACKED, HELD }
@@ -378,7 +381,7 @@ class HandRig {
             if (dt <= 0f) return
             val dx = x - rawX; val dy = y - rawY; val dz = z - rawZ
             val jump = sqrt(dx * dx + dy * dy + dz * dz)
-            if (dt > HOLD_SECONDS) {
+            if (dt > hold()) {
                 // Back after a loss: a new start, nothing is carried over.
                 following = false; dt = 0f
             } else if (jump > JUMP_METRES + JUMP_SPEED * dt) {
@@ -406,9 +409,11 @@ class HandRig {
         val fd = depthFilter.filter(depth, dt, DEPTH_SPEED_SCALE)
         val nx = fx * fd; val ny = fy * fd; val nz = -fd
         if (following && dt > 0f) {
-            velocity[0] += ((nx - centreX) / dt - velocity[0]) * .5f
-            velocity[1] += ((ny - centreY) / dt - velocity[1]) * .5f
-            velocity[2] += ((nz - centreZ) / dt - velocity[2]) * .5f
+            // Mostly the newest speed: in a simulated swing, an older one sends the hand on the
+            // wrong way at each turn.
+            velocity[0] += ((nx - centreX) / dt - velocity[0]) * VELOCITY_RATE
+            velocity[1] += ((ny - centreY) / dt - velocity[1]) * VELOCITY_RATE
+            velocity[2] += ((nz - centreZ) / dt - velocity[2]) * VELOCITY_RATE
         }
         centreX = nx; centreY = ny; centreZ = nz
 
@@ -447,10 +452,13 @@ class HandRig {
     fun advance(nowNs: Long, dt: Float) {
         if (!following) { lose(); return }
         val age = (nowNs - lastSampleNs) / 1e9f
-        if (age > HOLD_SECONDS) { lose(); return }
-        val fresh = (if (interval > 0f) interval * 1.5f else .10f).coerceIn(.05f, HOLD_SECONDS * .6f)
+        val hold = hold()
+        if (age > hold) { lose(); return }
+        // Up to two readings in a row may be missing, or one may take three times as long (the
+        // look for the second hand does), before the hand counts as held.
+        val fresh = (if (interval > 0f) interval * FRESH_READINGS else .10f).coerceIn(.10f, hold * .6f)
         if (age <= fresh) { state = State.TRACKED; confidence = 1f }
-        else { state = State.HELD; confidence = (1f - (age - fresh) / (HOLD_SECONDS - fresh)).coerceIn(0f, 1f) }
+        else { state = State.HELD; confidence = (1f - (age - fresh) / (hold - fresh)).coerceIn(0f, 1f) }
 
         // Between readings the hand goes on the way it was moving, but only for a short time and
         // only when it clearly moves: a still hand is never pushed around by its own tremor.
@@ -468,14 +476,25 @@ class HandRig {
         shown = true
     }
 
+    /**
+     * How long the last pose is kept after the last reading: at least [HOLD_SECONDS], and on a
+     * phone whose readings come slowly, the time of [HOLD_READINGS] of them.
+     */
+    private fun hold() = max(HOLD_SECONDS, min(interval * HOLD_READINGS, MAX_HOLD_SECONDS))
+
     private fun lose() {
         state = State.LOST; confidence = 0f; shown = false
         if (following) { following = false; fist.reset(); closed = false; velocity.fill(0f); interval = 0f }
     }
 
     companion object {
-        /** The last pose is kept this long after the last reading. */
-        const val HOLD_SECONDS = .35f
+        /** The last pose is kept at least this long after the last reading. */
+        const val HOLD_SECONDS = .9f
+        /** The longest the last pose is ever kept. */
+        const val MAX_HOLD_SECONDS = 2f
+        private const val HOLD_READINGS = 5f
+        private const val FRESH_READINGS = 3f
+        private const val VELOCITY_RATE = .8f
         /** Longest time the hand is moved on beyond its last reading. */
         const val MAX_LEAD_SECONDS = .07f
         // A reading further away than this from the one before is taken for a mistake.
@@ -491,6 +510,124 @@ class HandRig {
         private const val LENGTH_RATE = .05f
         private const val MIN_SIZE = .070f
         private const val MAX_SIZE = .115f
+    }
+}
+
+/**
+ * Which of the two trackers the next camera frame goes to (see [HandTracker]): the one for a
+ * single hand, which is cheap, or the one for two, which looks over the whole picture whenever
+ * it follows fewer than two hands and then costs about three times as much.
+ *
+ *  - With no hand followed the search is done by the tracker for two, so that two hands held up
+ *    together are both there from the first frame.
+ *  - With two hands followed it stays with the tracker for two, and gives a missing hand a few
+ *    frames to come back before it lets go.
+ *  - With one hand followed the cheap tracker does the work, and the other one takes a look for
+ *    the second hand now and then: never more often than once in [PROBE_FRAMES] + 1 frames, so
+ *    that on a slow phone the look cannot take most of the time.
+ */
+class TrackerChoice {
+    /** Two hands are followed, or were a moment ago. */
+    var pair = false
+        private set
+    private var following = false
+    private var singles = 0
+    private var missing = 0
+    private var lastLookNs = 0L
+    private var lastPairNs = 0L
+
+    fun reset() { pair = false; following = false; singles = 0; missing = 0; lastLookNs = 0L; lastPairNs = 0L }
+
+    /** True when the frame that starts at [nowNs] goes to the tracker for two hands. */
+    fun forTwo(nowNs: Long): Boolean =
+        pair || !following || (singles >= PROBE_FRAMES && nowNs - lastLookNs >= PROBE_NS)
+
+    /** A frame is done at [nowNs]: it went to the tracker for two if [usedTwo], and found [count] hands. */
+    fun result(usedTwo: Boolean, count: Int, nowNs: Long) {
+        following = count > 0
+        if (usedTwo) { lastLookNs = nowNs; singles = 0 } else singles++
+        if (usedTwo && count >= 2) { pair = true; missing = 0; lastPairNs = nowNs }
+        else if (pair && ++missing >= PAIR_FRAMES && nowNs - lastPairNs > PAIR_HOLD_NS) { pair = false; missing = 0 }
+    }
+
+    companion object {
+        /** While one hand is followed, the other one is looked for at most this often, */
+        const val PROBE_NS = 350_000_000L
+        /** and only after this many frames of following the first. */
+        const val PROBE_FRAMES = 6
+        /** With two hands followed, one may be missing this long, */
+        const val PAIR_HOLD_NS = 400_000_000L
+        /** and for at least this many frames, before the cheap tracker takes over. */
+        const val PAIR_FRAMES = 2
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The arms
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The arm between a shoulder and a wrist: two bones and an elbow. The player's arms are long, as
+ * in Gorilla Tag, because the hands reach [Coliseum.ARM_SCALE] times further than the real ones;
+ * when a hand goes further still, the arm stretches instead of letting go of it.
+ */
+object ArmPose {
+    /** Length of the upper arm and of the forearm, in metres. */
+    const val BONE = .80f
+    const val SHOULDER_ACROSS = .21f
+    const val SHOULDER_BELOW = .23f
+    const val SHOULDER_BEHIND = .07f
+
+    /**
+     * Where the shoulder of one arm is, written to [out] at [offset]: beside and a little below
+     * and behind the eyes at ([headX], [headY], [headZ]). The body turns with the head ([yaw]) but
+     * stays upright when the head nods. [side] is -1 for the left arm and 1 for the right one.
+     */
+    fun shoulder(headX: Float, headY: Float, headZ: Float, yaw: Float, side: Float, out: FloatArray, offset: Int) {
+        val c = cos(yaw); val sn = sin(yaw)
+        // To the right is (c, 0, sn); forward is (sn, 0, -c).
+        out[offset] = headX + c * side * SHOULDER_ACROSS - sn * SHOULDER_BEHIND
+        out[offset + 1] = headY - SHOULDER_BELOW
+        out[offset + 2] = headZ + sn * side * SHOULDER_ACROSS + c * SHOULDER_BEHIND
+    }
+
+    /**
+     * The elbow of the arm from the shoulder at [shoulders] `[offset..offset+2]` to the wrist at
+     * ([wx], [wy], [wz]), written to [out] at [offset]. It bends outwards, down and back, as a
+     * hanging arm does. Returns how many times longer than [BONE] each bone has to be: 1 while the
+     * hand is within reach.
+     */
+    fun elbow(shoulders: FloatArray, offset: Int, wx: Float, wy: Float, wz: Float, yaw: Float, side: Float, out: FloatArray): Float {
+        val sx = shoulders[offset]; val sy = shoulders[offset + 1]; val sz = shoulders[offset + 2]
+        var dx = wx - sx; var dy = wy - sy; var dz = wz - sz
+        val d = sqrt(dx * dx + dy * dy + dz * dz)
+        val c = cos(yaw); val sn = sin(yaw)
+        // Outwards, down and back.
+        var px = c * side * .7f - sn * .4f; var py = -.6f; var pz = sn * side * .7f + c * .4f
+        if (d < 1e-4f) {
+            val l = sqrt(px * px + py * py + pz * pz)
+            out[offset] = sx + px / l * BONE; out[offset + 1] = sy + py / l * BONE; out[offset + 2] = sz + pz / l * BONE
+            return 1f
+        }
+        dx /= d; dy /= d; dz /= d
+        val stretch = max(1f, d / (2f * BONE))
+        val bone = BONE * stretch
+        // Both bones are equally long: the elbow is over the middle, as far out as the bones allow.
+        val height = sqrt(max(0f, bone * bone - d * d * .25f))
+        val along = px * dx + py * dy + pz * dz
+        px -= along * dx; py -= along * dy; pz -= along * dz
+        var l = sqrt(px * px + py * py + pz * pz)
+        if (l < 1e-3f) {
+            // The arm points the way the elbow would go: any direction across it will do.
+            if (abs(dy) < .9f) { px = -dz; py = 0f; pz = dx } else { px = 1f; py = 0f; pz = 0f }
+            val again = px * dx + py * dy + pz * dz
+            px -= again * dx; py -= again * dy; pz -= again * dz
+            l = sqrt(px * px + py * py + pz * pz)
+        }
+        out[offset] = sx + dx * d * .5f + px / l * height
+        out[offset + 1] = sy + dy * d * .5f + py / l * height
+        out[offset + 2] = sz + dz * d * .5f + pz / l * height
+        return stretch
     }
 }
 

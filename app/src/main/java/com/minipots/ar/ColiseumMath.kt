@@ -441,12 +441,23 @@ class Coliseum {
     val handJoints = arrayOf(FloatArray(HAND_POINTS * 3), FloatArray(HAND_POINTS * 3))
     /** Middle of each palm in the world (x, y, z per hand). */
     val palm = FloatArray(6)
+    /** Shoulder and elbow of each arm in the world (x, y, z per arm); the wrist is the first joint of the hand. */
+    val shoulder = FloatArray(6)
+    val elbow = FloatArray(6)
+    /** How many times longer than [ArmPose.BONE] the bones of each arm are right now. */
+    val armStretch = floatArrayOf(1f, 1f)
 
     private val offsets = FloatArray(6)
     private val palmSpeed = FloatArray(6)
     private val lastFree = FloatArray(6)
     private val speedKnown = booleanArrayOf(false, false)
     private val openFor = FloatArray(2)
+    private val closedFor = FloatArray(2)
+    /** The hand closed on the weapon it carries: opening it now lets the weapon go. */
+    private val gripped = booleanArrayOf(false, false)
+    /** The weapon each hand has just let go of, which it does not take again until it moves away. */
+    private val letGo = arrayOfNulls<Weapon>(2)
+    private val letGoAt = FloatArray(6)
     /** The fastest the hand moved since it opened: a throw is let go at the speed of the swing. */
     private val openSpeed = FloatArray(6)
     private val grabLock = FloatArray(2)
@@ -460,7 +471,10 @@ class Coliseum {
         for (d in dummies) d.reset()
         held[0] = null; held[1] = null
         blows = 0; dummiesDown = 0; blowStrength = 0f
-        for (i in 0..1) { openFor[i] = 0f; grabLock[i] = 0f; handPresent[i] = false; speedKnown[i] = false }
+        for (i in 0..1) {
+            openFor[i] = 0f; closedFor[i] = 0f; gripped[i] = false; letGo[i] = null
+            grabLock[i] = 0f; handPresent[i] = false; speedKnown[i] = false; armStretch[i] = 1f
+        }
     }
 
     fun update(dt: Float, yaw: Float, pitch: Float, roll: Float, hands: Array<HandInput>) {
@@ -505,12 +519,21 @@ class Coliseum {
             } else { palmSpeed[i * 3] = 0f; palmSpeed[i * 3 + 1] = 0f; palmSpeed[i * 3 + 2] = 0f; speedKnown[i] = true }
             lastFree[i * 3] = qx; lastFree[i * 3 + 1] = qy; lastFree[i * 3 + 2] = qz
         }
+        for (i in 0..1) {
+            val side = if (i == 0) -1f else 1f
+            ArmPose.shoulder(body.x, body.y, body.z, yaw, side, shoulder, i * 3)
+            if (!handPresent[i]) continue
+            val j = handJoints[i]
+            armStretch[i] = ArmPose.elbow(shoulder, i * 3, j[0], j[1], j[2], yaw, side, elbow)
+        }
 
         for (i in 0..1) {
             val present = handPresent[i]
-            // Letting go needs a hand that is seen open for a moment: a fast swing blurs the
-            // picture and must not throw the weapon away.
+            // Nothing has to be held: a weapon is taken by touching its grip and stays in the hand,
+            // open or closed. Only a hand that closed on it and is then seen open for a moment
+            // lets it go; a fast swing blurs the picture and must not throw the weapon away.
             if (grabLock[i] > 0f) grabLock[i] -= dt
+            closedFor[i] = if (present && hands[i].closed) closedFor[i] + dt else 0f
             if (present && !hands[i].closed) {
                 val fastest = openSpeed[i * 3] * openSpeed[i * 3] + openSpeed[i * 3 + 1] * openSpeed[i * 3 + 1] + openSpeed[i * 3 + 2] * openSpeed[i * 3 + 2]
                 val now = palmSpeed[i * 3] * palmSpeed[i * 3] + palmSpeed[i * 3 + 1] * palmSpeed[i * 3 + 1] + palmSpeed[i * 3 + 2] * palmSpeed[i * 3 + 2]
@@ -521,9 +544,11 @@ class Coliseum {
             } else openFor[i] = 0f
             val carried = held[i]
             if (carried != null) {
-                if (openFor[i] > DROP_AFTER) {
+                if (closedFor[i] >= GRIP_AFTER) gripped[i] = true
+                if (gripped[i] && openFor[i] > DROP_AFTER) {
                     release(carried, openSpeed[i * 3], openSpeed[i * 3 + 1], openSpeed[i * 3 + 2])
-                    held[i] = null; grabLock[i] = GRAB_LOCK
+                    held[i] = null; grabLock[i] = GRAB_LOCK; gripped[i] = false; letGo[i] = carried
+                    letGoAt[i * 3] = palm[i * 3]; letGoAt[i * 3 + 1] = palm[i * 3 + 1]; letGoAt[i * 3 + 2] = palm[i * 3 + 2]
                 } else if (present) {
                     val j = handJoints[i]
                     // The weapon lies along the knuckles, from the little finger to the index, and
@@ -539,9 +564,20 @@ class Coliseum {
                         c.worldX(-.25f, .9f, -.35f), c.worldY(-.25f, .9f, -.35f), c.worldZ(-.25f, .9f, -.35f),
                         c.worldX(0f, 0f, -1f), c.worldY(0f, 0f, -1f), c.worldZ(0f, 0f, -1f))
                 }
-            } else if (present && hands[i].closed && grabLock[i] <= 0f) {
-                held[i] = weaponInReach(i)?.also {
-                    it.held = true; it.flying = false; it.tipKnown = false; it.tipSpeed = 0f
+            } else if (present) {
+                val near = weaponInReach(i)
+                // The weapon just let go of is free again once it has landed and the hand has
+                // left the place where it opened.
+                val last = letGo[i]
+                if (last != null && !last.flying) {
+                    val dx = palm[i * 3] - letGoAt[i * 3]; val dy = palm[i * 3 + 1] - letGoAt[i * 3 + 1]; val dz = palm[i * 3 + 2] - letGoAt[i * 3 + 2]
+                    if (dx * dx + dy * dy + dz * dz > LEAVE_DISTANCE * LEAVE_DISTANCE) letGo[i] = null
+                }
+                if (near != null && near !== letGo[i] && grabLock[i] <= 0f) {
+                    near.held = true; near.flying = false; near.tipKnown = false; near.tipSpeed = 0f
+                    held[i] = near
+                    // A hand that arrives closed has to open and close again to throw.
+                    gripped[i] = false; closedFor[i] = 0f
                 }
             }
         }
@@ -748,6 +784,10 @@ class Coliseum {
         const val BLOW_SPEED = 2.2f
         const val HEAVY_BLOW = 8f
         const val DROP_AFTER = .25f
+        /** A hand counts as closed on its weapon after being seen closed for this long. */
+        const val GRIP_AFTER = .15f
+        /** How far the hand has to go from where it let a weapon go before it can take that one again. */
+        const val LEAVE_DISTANCE = .45f
         const val AWAY_SECONDS = 4f
         private const val GRAB_LOCK = .4f
         /** How near the grip the palm has to be, with distance along the line of sight counting for [GRAB_ALONG]. */

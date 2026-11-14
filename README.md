@@ -32,6 +32,8 @@ O botão **Coliseu** (última fileira do Mini Pots) abre um segundo jogo; o bot�
 
 ![As duas imagens do Coliseu, com as duas mãos](docs/coliseu.png)
 
+*A imagem acima é da versão anterior, ainda sem os braços.*
+
 *Imagem gerada no computador pelo código de desenho do próprio jogo, com mãos lidas de fotografias pelo MediaPipe. Não é captura de tela de um celular.*
 
 **Antes de pôr o celular no óculos** (toque na tela esconde e mostra os botões):
@@ -43,9 +45,10 @@ O botão **Coliseu** (última fileira do Mini Pots) abre um segundo jogo; o bot�
 
 **Com o óculos no rosto**, as teclas de volume fazem o que os dedos não alcançam: **volume +** recentra a vista, **volume −** mostra ou esconde os botões.
 
-- **Mãos:** cada mão real aparece como uma mão 3D na cor da pele, com palma, dedos de três ossos, unhas e um punho curto, sem braço. Ela fica onde a mão real está na frente da câmera, à esquerda ou à direita, perto ou longe. Uma mão que a câmera perde continua no lugar por um instante, ficando cinza, e depois some; no lugar dela aparece um ponto âmbar embaixo, do lado da mão que falta. A mão nunca é desenhada onde ela não foi vista.
+- **Mãos:** cada mão real aparece como uma mão 3D na cor da pele, com palma, dedos de três ossos e unhas. Ela fica onde a mão real está na frente da câmera, à esquerda ou à direita, perto ou longe. Uma mão que a câmera perde continua no lugar por cerca de 1 segundo (mais em celular lento, até 2 segundos), ficando cinza aos poucos, e só depois some; no lugar dela aparece um ponto âmbar embaixo, do lado da mão que falta. A mão nunca é desenhada onde ela não foi vista.
+- **Braços:** cada mão tem um braço na mesma cor, do ombro ao cotovelo e do cotovelo ao pulso. O ombro fica um pouco abaixo e ao lado da cabeça e gira com o corpo; o cotovelo dobra para fora e para baixo. Só a mão é vista pela câmera: o braço é calculado a partir dela. Se a mão for mais longe do que o braço alcança, o braço estica em vez de se soltar da mão.
 - **Andar (como no Gorilla Tag):** não há pernas nem botão de andar. Olhe para o chão, encoste uma mão nele (aparece um círculo claro embaixo da mão) e puxe: o corpo vai para o lado contrário ao da mão. Puxar para trás anda para frente, empurrar para baixo levanta o corpo, e um empurrão rápido vira pulo ou deslize. As duas mãos valem, juntas ou alternadas, e também dá para se apoiar no muro e nos bonecos. A sombra de cada mão mostra a que altura ela está.
-- **Pegar:** feche a mão sobre o cabo da espada, do machado ou da maça fincados na areia. A arma fica na mão até você mostrar a mão aberta por um instante; se a mão estiver em movimento ao abrir, a arma é **arremessada**. Dá para segurar uma arma em cada mão. Se a câmera perder a mão no meio de um golpe, a arma não cai.
+- **Pegar, sem segurar:** encoste a mão, aberta ou fechada, no cabo da espada, do machado ou da maça fincados na areia. A arma gruda na mão e fica nela; não é preciso manter a mão fechada. Para **largar**, feche a mão e abra de novo; se a mão estiver em movimento ao abrir, a arma é **arremessada**. A arma largada só volta para a mesma mão depois que a mão se afasta dela. Dá para segurar uma arma em cada mão. Se a câmera perder a mão no meio de um golpe, a arma não cai.
 - **Bater:** balance a arma através de um boneco de palha. Só conta golpe rápido; encostar devagar não faz nada. Três golpes (ou menos, se forem fortes) desmontam o boneco, que volta depois de 4 segundos. Arma arremessada também acerta.
 - **Olhar em volta** — o botão **Olhar** alterna entre os modos que o aparelho permite, e a escolha fica guardada:
   - **giroscópio:** a vista acompanha a cabeça em todas as direções;
@@ -61,7 +64,8 @@ O cenário é simples de propósito: areia, muro, arquibancada, portão, duas ba
 ### O que mudou no rastreamento para o Coliseu
 
 - **Modelo leve.** O Coliseu usa o detector de palma normal com a rede de pontos "lite" do MediaPipe, montados em `hand_landmarker_lite.task` na compilação. No computador, a rede lite custou perto da metade do tempo por mão e achou a mão nas mesmas fotos que a completa. O Mini Pots continua com o modelo completo.
-- **Duas mãos sem pagar por duas o tempo todo.** Pedir duas mãos ao MediaPipe faz o detector de palma (a parte cara) rodar em todo quadro enquanto só uma mão está em cena. Por isso, com uma mão só, roda o rastreador de uma mão, e o de duas só é consultado a cada 350 ms para ver se a outra apareceu.
+- **Duas mãos sem pagar por duas o tempo todo.** Pedir duas mãos ao MediaPipe faz o detector de palma (a parte cara) rodar em todo quadro enquanto só uma mão está em cena. Por isso, com uma mão só, roda o rastreador de uma mão, e o de duas só é consultado de vez em quando para ver se a outra apareceu: no máximo a cada 350 ms e nunca mais que uma vez a cada sete quadros. Num celular que leva 100 ms por quadro, a consulta a cada 350 ms deixava menos de 5 leituras por segundo das 10 possíveis; com a regra nova sobram mais de 7 (conta feita com os tempos medidos no computador, não no celular). Sem nenhuma mão em cena, quem procura é o rastreador de duas mãos, e duas mãos levantadas juntas aparecem no mesmo quadro.
+- **Mão que não some à toa.** O tempo em que a mão perdida continua no lugar passou de 0,35 s para 0,9 s e cresce quando as leituras chegam devagar. Antes, num celular lento, a espera entre duas leituras podia passar de 0,35 s e a mão sumia mesmo estando na frente da câmera. O rastreador também ficou mais tolerante para manter uma mão que já segue (confiança mínima de 0,5 para 0,35), o que ajuda em quadros borrados pelo movimento; para achar uma mão nova a exigência é a mesma.
 - **A tela não espera a mão, e a mão não pula.** Cada mão passa por um filtro que tira o tremor quando ela está parada e deixa passar o movimento rápido; entre dois resultados a mão segue com a velocidade que tinha, por no máximo um instante. O comprimento dos ossos é mantido constante, para os dedos não esticarem e encolherem.
 - **Esquerda e direita não trocam.** Cada mão é ligada à que estava mais perto no resultado anterior, não à ordem em que o MediaPipe as devolve.
 
@@ -88,7 +92,7 @@ A qualidade depende da luz: com pouca luz a câmera borra o movimento e o rastre
 
 O rastreamento não pôde ser testado em aparelho neste repositório: a compilação e os testes de unidade rodam no GitHub Actions, mas os números de fps e Hz precisam ser conferidos no seu celular (eles aparecem na tela).
 
-O Coliseu também não foi jogado em aparelho, nem visto dentro de um óculos. As regras (andar com as duas mãos, pegar, soltar, arremessar, golpes, modos de olhar, as duas imagens) têm testes de unidade, e o desenho foi conferido no computador com um substituto da GPU. O que só o celular mostra: quantos quadros por segundo o rastreamento alcança com o modelo leve; se a distância das mãos, estimada pelo tamanho delas na imagem, deixa o chão fácil de alcançar; se o lado da palma e o das costas da mão saem certos (isso vem do rótulo "esquerda/direita" do MediaPipe); se os sensores de cada aparelho dão a direção esperada com o celular deitado; e se os valores padrão de DIP e de lente servem para o seu óculos. Não há correção da distorção das lentes: as bordas da imagem podem parecer curvas.
+O Coliseu também não foi jogado em aparelho, nem visto dentro de um óculos. As regras (andar com as duas mãos, pegar, soltar, arremessar, golpes, modos de olhar, as duas imagens, a posição dos braços, a escolha do rastreador) têm testes de unidade. O desenho das mãos foi conferido no computador com um substituto da GPU; o dos braços ainda não foi visto em tela nenhuma. O que só o celular mostra: quantos quadros por segundo o rastreamento alcança com o modelo leve; se a distância das mãos, estimada pelo tamanho delas na imagem, deixa o chão fácil de alcançar; se o lado da palma e o das costas da mão saem certos (isso vem do rótulo "esquerda/direita" do MediaPipe); se os sensores de cada aparelho dão a direção esperada com o celular deitado; e se os valores padrão de DIP e de lente servem para o seu óculos. Não há correção da distorção das lentes: as bordas da imagem podem parecer curvas.
 
 ## Compilação
 

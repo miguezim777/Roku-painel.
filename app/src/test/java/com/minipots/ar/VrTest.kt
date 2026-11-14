@@ -10,6 +10,7 @@ import org.junit.Test
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -338,16 +339,17 @@ class VrTest {
         var now = follow(rig, 1_000_000_000L, .5f, 1f / 30f) { reading(open, .1f, 0f, -.4f) }
         assertEquals(HandRig.State.TRACKED, rig.state); assertEquals(1f, rig.confidence, 0f)
         // Readings stop. For a moment the last pose is kept, with less and less confidence.
-        now = follow(rig, now, .15f, 1f) { null }
+        now = follow(rig, now, .3f, 1f) { null }
         assertEquals(HandRig.State.HELD, rig.state)
         val early = rig.confidence
         assertTrue(early > 0f && early < 1f)
         assertEquals(.1f, palmOf(rig.joints)[0], .01f)
-        now = follow(rig, now, .12f, 1f) { null }
+        // A slow phone can take this long between two readings: the hand must still be there.
+        now = follow(rig, now, .4f, 1f) { null }
         assertEquals(HandRig.State.HELD, rig.state)
         assertTrue(rig.confidence < early)
         // After that it is lost, and says so.
-        now = follow(rig, now, .15f, 1f) { null }
+        now = follow(rig, now, .3f, 1f) { null }
         assertEquals(HandRig.State.LOST, rig.state); assertEquals(0f, rig.confidence, 0f)
         now = follow(rig, now, 1f, 1f) { null }
         assertEquals(HandRig.State.LOST, rig.state)
@@ -356,6 +358,27 @@ class VrTest {
         rig.advance(now, dt)
         assertEquals(HandRig.State.TRACKED, rig.state)
         assertEquals(-.15f, palmOf(rig.joints)[0], .015f)
+    }
+
+    @Test fun handOfASlowPhoneStaysFollowedBetweenItsReadingsAndIsHeldLonger() {
+        val open = model(0f)
+        val rig = HandRig()
+        // Four readings a second, and now and then one takes three times as long: that is what
+        // the look for the second hand costs on a slow phone.
+        var now = 1_000_000_000L; var next = 0f; var t = 0f; var readings = 0
+        while (t < 4f) {
+            if (t >= next) { rig.accept(reading(open, .1f, 0f, -.4f), now, 4f / 3f, .77f); next += if (++readings % 4 == 0) .75f else .25f }
+            rig.advance(now, dt)
+            if (t > .6f) assertEquals("at $t s", HandRig.State.TRACKED, rig.state)
+            now += (dt * 1e9f).toLong(); t += dt
+        }
+        // Readings stop. A fast phone gives the hand up after 0.9 s; this one has to wait longer
+        // to know, so the hand is kept longer, and then it is lost all the same.
+        now = follow(rig, now, HandRig.HOLD_SECONDS + .2f, 9f) { null }
+        assertEquals(HandRig.State.HELD, rig.state)
+        assertEquals(.1f, palmOf(rig.joints)[0], .01f)
+        follow(rig, now, HandRig.MAX_HOLD_SECONDS, 9f) { null }
+        assertEquals(HandRig.State.LOST, rig.state)
     }
 
     @Test fun handIsMovedOnBetweenReadingsButOnlyALittle() {
@@ -668,19 +691,60 @@ class VrTest {
 
     // ------------------------------------------------------------ 7. weapons
 
-    /** Stands at the sword and closes hand [i] on its grip. */
+    /** Stands at the sword and puts hand [i] on its grip, then closes it. */
     private fun Coliseum.takeSword(i: Int): Weapon {
         val sword = weapons[0]
         body.reset(sword.x, GorillaBody.EYE_HEIGHT, sword.z + .8f)
         place(i, 0f, sword.y - GorillaBody.EYE_HEIGHT, -.8f)
         frames(5)
-        assertNull(held[i])
         place(i, 0f, sword.y - GorillaBody.EYE_HEIGHT, -.8f, closed = true)
         frames(3)
         return sword
     }
 
-    @Test fun closedHandOnTheGripTakesTheWeaponAndItStaysInThatHand() {
+    @Test fun openHandOnTheGripTakesTheWeaponAndNeverHasToClose() {
+        for (hand in 0..1) {
+            val g = game()
+            val sword = g.weapons[0]
+            g.body.reset(sword.x, GorillaBody.EYE_HEIGHT, sword.z + .8f)
+            // An open hand beside the grip takes nothing; on the grip, it takes the sword.
+            place(hand, .5f, sword.y - GorillaBody.EYE_HEIGHT, -.8f); g.frames(10)
+            assertNull(g.held[hand])
+            place(hand, 0f, sword.y - GorillaBody.EYE_HEIGHT, -.8f); g.frames(2)
+            assertSame(sword, g.held[hand]); assertTrue(sword.held)
+            // It stays in the open hand for as long as one likes, wherever the hand goes.
+            g.stroke(hand, 60, 0f, .18f, -.8f, .4f, .5f, -.6f)
+            g.frames(120)
+            assertSame(sword, g.held[hand])
+            assertEquals(g.palm[hand * 3], sword.x, .02f); assertEquals(g.palm[hand * 3 + 1], sword.y, .02f)
+            // Losing the hand and finding it again changes nothing.
+            hide(hand); g.frames(90)
+            place(hand, .2f, .3f, -.7f); g.frames(60)
+            assertSame(sword, g.held[hand])
+            // A glimpse of a closed hand, as a blurred picture gives, does not make it droppable.
+            place(hand, .2f, .3f, -.7f, closed = true); g.frames(4)
+            place(hand, .2f, .3f, -.7f); g.frames(60)
+            assertSame(sword, g.held[hand])
+        }
+    }
+
+    @Test fun weaponLetGoIsNotTakenAgainUntilTheHandHasLeftIt() {
+        val g = game()
+        val sword = g.takeSword(1)
+        val y = sword.y - GorillaBody.EYE_HEIGHT
+        place(1, 0f, y, -.8f, closed = true); g.frames(20)
+        assertSame(sword, g.held[1])
+        // Closed and then open: let go. The hand stays right there, and the sword stays free.
+        place(1, 0f, y, -.8f); g.frames(120)
+        assertNull(g.held[1]); assertFalse(sword.held)
+        // The hand goes away and comes back: taken again.
+        place(1, .6f, y, -.8f); g.frames(10)
+        assertNull(g.held[1])
+        place(1, 0f, sword.y - GorillaBody.EYE_HEIGHT, -.8f); g.frames(3)
+        assertSame(sword, g.held[1])
+    }
+
+    @Test fun handOnTheGripTakesTheWeaponAndItStaysInThatHand() {
         for (hand in 0..1) {
             val g = game()
             val sword = g.takeSword(hand)
@@ -913,5 +977,152 @@ class VrTest {
         // A phone has 16 ms per frame; this is a desktop JVM, so only a gross error would show.
         assertTrue("one frame took $perFrameMs ms", perFrameMs < 2f)
         assertFalse(g.body.x.isNaN() || g.body.y.isNaN() || g.body.z.isNaN())
+    }
+
+    // ------------------------------------------------------------ the arms
+
+    private fun distance(a: FloatArray, i: Int, x: Float, y: Float, z: Float): Float {
+        val dx = a[i] - x; val dy = a[i + 1] - y; val dz = a[i + 2] - z
+        return sqrt(dx * dx + dy * dy + dz * dz)
+    }
+
+    @Test fun shouldersAreBesideAndBelowTheEyesAndTurnWithTheBody() {
+        val s = FloatArray(6)
+        ArmPose.shoulder(1f, 2f, 3f, 0f, -1f, s, 0); ArmPose.shoulder(1f, 2f, 3f, 0f, 1f, s, 3)
+        // Looking along -z: left is -x, behind is +z.
+        assertEquals(1f - ArmPose.SHOULDER_ACROSS, s[0], 1e-5f); assertEquals(1f + ArmPose.SHOULDER_ACROSS, s[3], 1e-5f)
+        assertEquals(2f - ArmPose.SHOULDER_BELOW, s[1], 1e-5f); assertEquals(s[1], s[4], 0f)
+        assertEquals(3f + ArmPose.SHOULDER_BEHIND, s[2], 1e-5f); assertEquals(s[2], s[5], 1e-6f)
+        // A quarter turn to the right: looking along +x, the right shoulder is at +z, behind is -x.
+        ArmPose.shoulder(1f, 2f, 3f, 1.5707964f, 1f, s, 3)
+        assertEquals(1f - ArmPose.SHOULDER_BEHIND, s[3], 1e-5f)
+        assertEquals(3f + ArmPose.SHOULDER_ACROSS, s[5], 1e-5f)
+    }
+
+    @Test fun elbowKeepsBothBonesTheirLengthAndBendsOutwardsAndDown() {
+        val s = FloatArray(6); val e = FloatArray(6)
+        for (arm in 0..1) {
+            val side = if (arm == 0) -1f else 1f
+            ArmPose.shoulder(0f, .8f, 0f, 0f, side, s, arm * 3)
+            // The wrist straight ahead of the shoulder, well within reach.
+            val wx = s[arm * 3]; val wy = s[arm * 3 + 1]; val wz = s[arm * 3 + 2] - .9f
+            assertEquals(1f, ArmPose.elbow(s, arm * 3, wx, wy, wz, 0f, side, e), 0f)
+            assertEquals(ArmPose.BONE, distance(e, arm * 3, s[arm * 3], s[arm * 3 + 1], s[arm * 3 + 2]), 1e-4f)
+            assertEquals(ArmPose.BONE, distance(e, arm * 3, wx, wy, wz), 1e-4f)
+            assertTrue("elbow of arm $arm goes outwards", (e[arm * 3] - s[arm * 3]) * side > .2f)
+            assertTrue("elbow of arm $arm goes down", e[arm * 3 + 1] < wy - .2f)
+        }
+    }
+
+    @Test fun armStretchesToAHandOutOfReachAndSurvivesAHandOnTheShoulder() {
+        val s = FloatArray(3); val e = FloatArray(3)
+        ArmPose.shoulder(0f, .8f, 0f, 0f, 1f, s, 0)
+        // Two and a half metres away: both bones grow by the same factor and the arm is straight.
+        val stretch = ArmPose.elbow(s, 0, s[0], s[1], s[2] - 2.4f, 0f, 1f, e)
+        assertEquals(1.5f, stretch, 1e-4f)
+        assertEquals(s[0], e[0], 1e-3f); assertEquals(s[1], e[1], 1e-3f); assertEquals(s[2] - 1.2f, e[2], 1e-3f)
+        // Exactly at arm's length there is no bend and no stretch.
+        assertEquals(1f, ArmPose.elbow(s, 0, s[0], s[1], s[2] - 1.6f, 0f, 1f, e), 1e-5f)
+        // The wrist on the shoulder, and the wrist along the way the elbow bends: no NaN.
+        ArmPose.elbow(s, 0, s[0], s[1], s[2], 0f, 1f, e)
+        assertFalse(e[0].isNaN() || e[1].isNaN() || e[2].isNaN())
+        assertEquals(ArmPose.BONE, distance(e, 0, s[0], s[1], s[2]), 1e-4f)
+        ArmPose.elbow(s, 0, s[0] + .7f * .5f, s[1] - .6f * .5f, s[2] + .4f * .5f, 0f, 1f, e)
+        assertFalse(e[0].isNaN() || e[1].isNaN() || e[2].isNaN())
+        assertEquals(ArmPose.BONE, distance(e, 0, s[0], s[1], s[2]), 1e-3f)
+    }
+
+    @Test fun gameGivesEveryHandInViewAnArmFromItsShoulderToItsWrist() {
+        val g = game()
+        place(0, -.3f, -.2f, -.8f); place(1, .3f, -.2f, -.8f)
+        g.frames(10)
+        for (arm in 0..1) {
+            val j = g.handJoints[arm]
+            val bone = ArmPose.BONE * g.armStretch[arm]
+            assertEquals(bone, distance(g.elbow, arm * 3, j[0], j[1], j[2]), 1e-3f)
+            assertEquals(bone, distance(g.elbow, arm * 3, g.shoulder[arm * 3], g.shoulder[arm * 3 + 1], g.shoulder[arm * 3 + 2]), 1e-3f)
+            assertEquals(g.body.y - ArmPose.SHOULDER_BELOW, g.shoulder[arm * 3 + 1], 1e-5f)
+        }
+        assertTrue(g.shoulder[0] < g.body.x && g.shoulder[3] > g.body.x)
+        // The arms follow the body when it moves.
+        g.body.reset(3f, GorillaBody.EYE_HEIGHT, 2f); g.frames(2)
+        assertEquals(3f + ArmPose.SHOULDER_ACROSS, g.shoulder[3], 1e-4f)
+    }
+
+    // ------------------------------------------------------------ which tracker gets the frame
+
+    /**
+     * Runs [choice] for [seconds] on a phone where a frame of the single-hand tracker takes
+     * [single] seconds and a look over the whole picture [look] seconds, with [handsAt] hands in
+     * view. Returns how many frames each tracker got and the longest wait between two looks.
+     */
+    private fun track(choice: TrackerChoice, startNs: Long, seconds: Float, single: Float, look: Float, handsAt: (Float) -> Int, out: FloatArray): Long {
+        var now = startNs; val end = startNs + (seconds * 1e9f).toLong()
+        var lastLook = startNs; out.fill(0f)
+        while (now < end) {
+            val hands = handsAt((now - startNs) / 1e9f)
+            val two = choice.forTwo(now)
+            // The tracker for two looks over the whole picture unless it already follows two hands.
+            val cost = if (!two) single else if (choice.pair && hands >= 2) single * 2f else look
+            if (two) { out[2] = max(out[2], (now - lastLook) / 1e9f) }
+            now += (cost * 1e9f).toLong()
+            if (two) lastLook = now
+            choice.result(two, if (two) hands else min(hands, 1), now)
+            out[if (two) 1 else 0] += 1f
+        }
+        return now
+    }
+
+    @Test fun twoHandsHeldUpTogetherAreBothFoundByTheFirstFrame() {
+        val choice = TrackerChoice()
+        assertTrue(choice.forTwo(0L))
+        choice.result(true, 2, 100_000_000L)
+        assertTrue(choice.pair)
+        assertTrue(choice.forTwo(100_000_000L))
+        // Nothing in view: the search goes on with the tracker for two.
+        val none = TrackerChoice()
+        none.result(true, 0, 100_000_000L)
+        assertTrue(none.forTwo(100_000_000L))
+        assertFalse(none.pair)
+    }
+
+    @Test fun lookForTheSecondHandNeverTakesMostOfTheTimeOfASlowPhone() {
+        val n = FloatArray(3)
+        // A slow phone: 100 ms to follow one hand, 320 ms to look over the whole picture.
+        val slow = TrackerChoice()
+        track(slow, 0L, 20f, .100f, .320f, { 1 }, n)
+        assertTrue("single ${n[0]} looks ${n[1]}", n[0] >= (n[1] - 1f) * TrackerChoice.PROBE_FRAMES)
+        // More than seven readings a second are left of the ten the phone can do; looking every
+        // 350 ms, as before, left fewer than five.
+        assertTrue("${(n[0] + n[1]) / 20f} readings a second", (n[0] + n[1]) / 20f > 7f)
+        // And the second hand never waits much longer than a second to be seen.
+        assertTrue("${n[2]} s between looks", n[2] < 1.1f)
+        // A fast phone looks about three times a second, as it did.
+        val fast = TrackerChoice()
+        track(fast, 0L, 20f, .015f, .048f, { 1 }, n)
+        assertTrue("${n[1]} looks", n[1] in 40f..58f)
+        assertTrue("${n[2]} s between looks", n[2] < .40f)
+    }
+
+    @Test fun handThatGoesMissingGetsItsFramesBeforeTheCheapTrackerTakesOver() {
+        val n = FloatArray(3)
+        val choice = TrackerChoice()
+        var now = track(choice, 0L, 1f, .100f, .320f, { 2 }, n)
+        assertTrue(choice.pair); assertEquals(0f, n[0], 0f)
+        // One hand is missed. On this phone one frame alone takes most of 400 ms: it still gets a second one.
+        choice.forTwo(now); now += 320_000_000L; choice.result(true, 1, now)
+        assertTrue(choice.pair)
+        // It is back on that second frame: nothing changes.
+        choice.forTwo(now); now += 320_000_000L; choice.result(true, 2, now)
+        assertTrue(choice.pair)
+        // Missed for good: after two frames and 400 ms the cheap tracker follows the hand that is left.
+        choice.forTwo(now); now += 320_000_000L; choice.result(true, 1, now)
+        assertTrue(choice.pair)
+        choice.forTwo(now); now += 320_000_000L; choice.result(true, 1, now)
+        assertFalse(choice.pair)
+        assertFalse(choice.forTwo(now))
+        // The hand that is left is lost too: the search is for both again.
+        now += 100_000_000L; choice.result(false, 0, now)
+        assertTrue(choice.forTwo(now))
     }
 }

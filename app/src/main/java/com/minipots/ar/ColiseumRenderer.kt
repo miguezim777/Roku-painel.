@@ -192,7 +192,9 @@ class ColiseumRenderer(
         for (dummy in game.dummies) d.dummy(dummy)
         for (weapon in game.weapons) d.weapon(weapon)
         for (i in 0..1) if (game.handPresent[i]) {
-            d.hand(game.handJoints[i], Coliseum.ARM_SCALE, rigs[i].palmSign, rigs[i].confidence, c.eyeX, c.eyeY, c.eyeZ)
+            val j = game.handJoints[i]
+            d.arm(game.shoulder, game.elbow, i * 3, j[0], j[1], j[2], Coliseum.ARM_SCALE, rigs[i].confidence, c.eyeX, c.eyeY, c.eyeZ)
+            d.hand(j, Coliseum.ARM_SCALE, rigs[i].palmSign, rigs[i].confidence, c.eyeX, c.eyeY, c.eyeZ)
         }
 
         // A hand that is not followed is never drawn as if it were: a small dot says so instead.
@@ -261,8 +263,8 @@ class ColiseumRenderer(
                 LookMode.TILT -> if (stereo.stereo) "Sem giroscópio: incline a cabeça para o lado para virar." else "Incline o celular para olhar para cima e para baixo e arraste o dedo para virar."
                 LookMode.TOUCH -> "Arraste o dedo na tela para olhar em volta."
             }
-            armed -> "Golpes: ${game.blows} · Bonecos derrubados: ${game.dummiesDown}. Bata nos bonecos de palha. Abra a mão para soltar a arma."
-            else -> "Olhe para baixo, encoste a mão no chão e puxe para andar (como no Gorilla Tag). Empurre o chão para pular. Feche a mão no cabo de uma arma para pegar."
+            armed -> "Golpes: ${game.blows} · Bonecos derrubados: ${game.dummiesDown}. Bata nos bonecos de palha. A arma fica na mão sozinha; para largar, feche a mão e abra."
+            else -> "Olhe para baixo, encoste a mão no chão e puxe para andar (como no Gorilla Tag). Empurre o chão para pular. Encoste a mão no cabo de uma arma para pegar: não precisa segurar."
         })
     }
 
