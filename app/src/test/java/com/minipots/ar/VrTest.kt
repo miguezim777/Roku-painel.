@@ -54,7 +54,7 @@ class VrTest {
     private fun palmOf(p: FloatArray, out: FloatArray = FloatArray(3)): FloatArray {
         out.fill(0f)
         for (i in HandGeometry.PALM) { out[0] += p[i * 3]; out[1] += p[i * 3 + 1]; out[2] += p[i * 3 + 2] }
-        for (k in 0..2) out[k] /= HandGeometry.PALM.size
+        for (k in 0..2) out[k] = out[k] / HandGeometry.PALM.size.toFloat()
         return out
     }
 
