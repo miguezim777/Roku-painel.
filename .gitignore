@@ -3,3 +3,6 @@ local.properties
 **/build/
 .idea/
 *.iml
+# Downloaded by Gradle at build time (see app/build.gradle.kts).
+app/src/main/assets/hand_landmarker.task
+app/src/main/assets/hand_landmarker.task.tmp

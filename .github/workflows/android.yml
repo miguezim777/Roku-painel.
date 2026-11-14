@@ -13,8 +13,25 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
+      - name: Check APK contents
+        run: |
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$apk" > apk-contents.txt
+          grep -E "assets/|lib/" apk-contents.txt || true
+          for entry in assets/hand_landmarker.task lib/arm64-v8a/libmediapipe_tasks_vision_jni.so lib/armeabi-v7a/libmediapipe_tasks_vision_jni.so; do
+            grep -q " $entry\$" apk-contents.txt || { echo "missing from APK: $entry"; exit 1; }
+          done
+          ls -l "$apk"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-report
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: mini-pots-ar-debug
