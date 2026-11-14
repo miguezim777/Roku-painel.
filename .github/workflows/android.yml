@@ -37,6 +37,12 @@ jobs:
               grep -qE " $entry\$" apk-contents.txt || { echo "error: missing from APK: $entry"; exit 1; }
             done
           } 2>&1 | tee -a build.log
+      - name: Summary
+        shell: bash
+        run: |
+          tests=$(grep -ho '<testsuite [^>]*' app/build/test-results/testDebugUnitTest/*.xml | sed -E 's/.*tests="([0-9]+)".*failures="([0-9]+)".*errors="([0-9]+)".*/\1 tests, \2 failures, \3 errors/')
+          size=$(stat -c %s app/build/outputs/apk/debug/app-debug.apk)
+          echo "::notice title=Result::Unit tests: ${tests}. APK: $((size / 1048576)) MB."
       # Shows the reason for a failure on the run page itself, without opening the full log.
       - name: Report failure
         if: failure()
