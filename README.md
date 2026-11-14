@@ -43,7 +43,8 @@ O botão **Coliseu** (última fileira do Mini Pots) abre um segundo jogo; o bot�
 - **Andar: contato / fluido** troca o modo de andar (abaixo). Só um dos dois age de cada vez.
 - **Altura − / Altura +** ajusta a altura dos olhos acima do chão (50 a 130 cm; padrão 80). **Mãos − / Mãos +** ajusta quantas vezes mais longe que a mão real a mão do jogo alcança (1,2 a 3,2 vezes; padrão 2,5). Se o chão estiver difícil de alcançar, baixe a altura ou aumente as mãos. O botão do meio mostra os valores e, tocado, volta ao padrão.
 - **Mãos: duas / uma (rápido)** escolhe quantas mãos o rastreamento segue. Com **uma**, ele nunca procura a segunda mão, que é a parte que mais custa tempo; dá para andar, pegar e bater com uma mão só. Use se a linha de medições mostrar `rastreio` abaixo de uns 12 Hz. (Sem efeito quando o rastreamento roda na GPU.)
-- **Copiar medições** põe na área de transferência os últimos 3 minutos da linha de medições, com o modelo do aparelho.
+- **Copiar medições** põe na área de transferência o modelo do aparelho, um **resumo da sessão** em poucas linhas (por quanto tempo as mãos apareceram, quantas vezes sumiram, quanto cada uma tocou o chão e a que distância dele chegou, quanto o corpo andou, armas pegas, custo do rastreamento) e depois os últimos 3 minutos da linha de medições, do segundo mais novo para o mais antigo. Se a mensagem cortar o texto, o que importa já foi.
+- **Bússola: rápida / suave** (só aparece em aparelho sem giroscópio). **Rápida** alisa a vista só com a cabeça parada e cada vez menos quando ela gira, para a imagem não chegar atrasada; **suave** é o comportamento antigo, sempre alisado, que treme menos e chega um quarto de segundo depois da cabeça.
 
 **Com o óculos no rosto**, as teclas de volume fazem o que os dedos não alcançam: **volume +** recentra a vista, **volume −** mostra ou esconde os botões.
 
@@ -56,12 +57,12 @@ O botão **Coliseu** (última fileira do Mini Pots) abre um segundo jogo; o bot�
 - **Bater:** balance a arma através de um boneco de palha. Só conta golpe rápido; encostar devagar não faz nada. Três golpes (ou menos, se forem fortes) desmontam o boneco, que volta depois de 4 segundos. Arma arremessada também acerta.
 - **Olhar em volta** — o botão **Olhar** alterna entre os modos que o aparelho permite, e a escolha fica guardada:
   - **giroscópio:** a vista acompanha a cabeça em todas as direções;
-  - **bússola** (aparece no lugar do giroscópio em aparelho **sem giroscópio** que tenha bússola): a vista também acompanha a cabeça, mas com menos firmeza, e ímãs por perto atrapalham;
+  - **bússola** (aparece no lugar do giroscópio em aparelho **sem giroscópio** que tenha bússola): a vista também acompanha a cabeça, mas com menos firmeza, e ímãs por perto atrapalham. A bússola treme e por isso é alisada; ver o botão **Bússola: rápida / suave**. Um aparelho sem giroscópio nunca segue a cabeça tão bem quanto um com;
   - **inclinar** (só acelerômetro): olhar para cima e para baixo acompanha a cabeça; para virar, incline a cabeça para o ombro do lado desejado (a vista gira enquanto a cabeça estiver inclinada);
   - **dedo:** arrastar o dedo na tela faz tudo. Serve fora do óculos.
 - **Recomeçar** devolve você ao portão e as armas à areia.
 
-A linha pequena no alto começa por `chão E … D …`: a quantos centímetros do chão está cada mão do jogo (`toca` quando ela segura o chão, `–` quando não há mão, `braço esticado` quando a câmera pediu mais braço do que existe). É o que diz se o chão está ao alcance: se o número não chega perto de zero, baixe **Altura** ou aumente **Mãos**. Depois vêm, medidos separadamente: quadros por segundo da tela (e o tempo de desenho de um quadro), quadros por segundo da câmera, quantas vezes por segundo as mãos foram de fato atualizadas, o tempo das redes, o atraso entre a foto e o resultado, quantas mãos estão em cena e onde o rastreamento roda (`CPU leve` quer dizer CPU com o modelo leve). Depois vêm: `quedas` (quadros da tela que demoraram mais de 25 ms no último segundo), a taxa da física e o modo de andar, `saltos de mão` (leituras recusadas por pularem mais do que uma mão consegue), a memória em uso (objetos do app + memória nativa), a temperatura da bateria e, do Android 10 em diante, o `freio térmico` (0 = o sistema não está segurando o aparelho por calor).
+A linha pequena no alto começa por `chão E … D …`: a quantos centímetros do chão está cada mão do jogo (`toca` quando ela segura o chão, `–` quando não há mão, `braço esticado` quando a câmera pediu mais braço do que existe). É o que diz se o chão está ao alcance: se o número não chega perto de zero, baixe **Altura** ou aumente **Mãos**. Depois vêm, medidos separadamente: quadros por segundo da tela (e o tempo de desenho de um quadro, que inclui a espera pela tela), `entrega` (fotos por segundo que chegam ao rastreador, que só pega uma quando está livre), quantas vezes por segundo as mãos foram de fato atualizadas, o tempo das redes com mão, `busca` (o custo de procurar mãos numa foto em que nenhuma é seguida), o atraso entre a foto e o resultado, quantas mãos estão em cena e onde o rastreamento roda (`CPU leve` quer dizer CPU com o modelo leve). No fim da linha: `câmera` (fotos que a câmera faz de fato por segundo, e o ritmo pedido a ela), `exposição` (quanto tempo cada foto junta luz, quando o aparelho informa), `luz` (o quão clara a imagem sai) e `sensor do olhar` (leituras por segundo do sensor que segue a cabeça). Também: `quedas` (quadros da tela que demoraram mais de 25 ms no último segundo), o modo de andar, `saltos de mão` (leituras recusadas por pularem mais do que uma mão consegue), a memória em uso (objetos do app + memória nativa), a temperatura da bateria e, do Android 10 em diante, o `freio térmico` (0 = o sistema não está segurando o aparelho por calor).
 
 O cenário é simples de propósito: areia, muro, arquibancada, portão, duas bandeiras, sol e nuvem. A arena inteira é uma chamada de desenho por olho e o céu é outra.
 
@@ -83,6 +84,8 @@ Quatro defeitos foram relatados por quem jogou. O que foi feito, e o que cada co
 - **Travamentos.** Opção de seguir uma mão só; o desenho encolhe sozinho se a tela não acompanhar.
 
 Nada disso foi conferido em aparelho por quem escreveu o código: só em simulação e em testes de unidade.
+
+Depois vieram as primeiras medições do aparelho (um Xiaomi sem giroscópio), e com elas: a vista deixou de chegar um quarto de segundo depois da cabeça no modo bússola; a procura da segunda mão espera enquanto a primeira está em movimento rápido; as medições ganharam um resumo e os números da câmera. Também em [docs/RELATORIO-VR.md](docs/RELATORIO-VR.md).
 
 ### Como o corpo se move
 
