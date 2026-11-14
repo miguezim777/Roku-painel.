@@ -72,10 +72,19 @@ private class PendingStream(val request: SurfaceRequest, val mirror: Boolean)
  * A pinch (thumb and index together) acts as a finger on the screen: where it starts, moves and
  * ends drives exactly the same code as touch.
  */
-class RoomRenderer(private val tracker: HandTracker, private val callbacks: Callbacks) : GLSurfaceView.Renderer {
+class RoomRenderer(
+    private val tracker: HandTracker,
+    private val callbacks: Callbacks,
+    chooseProcessor: Boolean,
+) : GLSurfaceView.Renderer {
     interface Callbacks {
         fun status(text: String)
         fun stats(text: String)
+        /**
+         * The measurements say where tracking should run. Costs are in milliseconds per tracked
+         * frame, rates in frames drawn per second; the GPU's are 0 if it was not measured.
+         */
+        fun processor(action: ProcessorChooser.Action, cpuMs: Float, gpuMs: Float, cpuFps: Float, gpuFps: Float)
         /** The GL context was recreated: the camera must be bound again to get a new surface. */
         fun contextLost()
     }
@@ -136,6 +145,10 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
     private var noticeUntilNs = 0L
     @Volatile private var trackerError: String? = null
     private val pendingNotice = AtomicReference<String?>(null)
+    private var chooser: ProcessorChooser? = if (chooseProcessor) ProcessorChooser() else null
+    private var lastFollowed = 0
+    private var cameraSlowSeconds = 0
+    private var cameraWarned = false
     private var statsStartNs = 0L
     private var statsFrames = 0
 
@@ -635,7 +648,8 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
 
     private fun notice(text: String) {
         callbacks.status(text)
-        noticeUntilNs = System.nanoTime() + NOTICE_NS
+        // Long messages stay long enough to be read.
+        noticeUntilNs = System.nanoTime() + max(NOTICE_NS, text.length * NOTICE_NS_PER_CHARACTER)
         statusKey = -1
     }
 
@@ -671,6 +685,21 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
         val where = if (tracker.usingGpu) "GPU" else "CPU"
         callbacks.stats("$fps fps · mão $rate Hz · ${tracker.frameCostMs.roundToInt()} ms · $where")
         statsStartNs = now; statsFrames = 0
+        chooser?.let { c ->
+            val action = c.onSecond(fps, tracker.trackedFrames, tracker.trackedCostMs, tracker.usingGpu, tracker.preferGpu)
+            if (action != ProcessorChooser.Action.NONE) callbacks.processor(action, c.cpuCostMs, c.gpuCostMs, c.cpuFps, c.gpuFps)
+            if (c.finished) chooser = null
+        }
+        // Frames that cost little and still come slowly are waiting for the camera, which lowers
+        // its rate in poor light. No processor can fix that, so the player is told what can.
+        val followed = tracker.trackedFrames
+        val waiting = followed > lastFollowed && rate in 1..CAMERA_SLOW_HZ && tracker.trackedCostMs < 1000f / (rate * 2)
+        lastFollowed = followed
+        cameraSlowSeconds = if (waiting) cameraSlowSeconds + 1 else 0
+        if (!cameraWarned && cameraSlowSeconds >= CAMERA_SLOW_SECONDS) {
+            cameraWarned = true
+            notice("A câmera está entregando só $rate imagens por segundo, e o rastreamento não tem como ir além disso. Com mais luz ela acelera.")
+        }
     }
 
     private fun kindName(k: ItemKind) = when (k) {
@@ -679,6 +708,9 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
     }
 
     // ---------------------------------------------------------------- commands (buttons)
+
+    /** The user chose the processor by hand: the automatic comparison stops. */
+    fun stopChoosingProcessor() { chooser = null }
 
     fun switchMode(m: Mode) { mode = m; statusKey = -1 }
     fun itemMode(kind: ItemKind) { itemKind = kind; switchMode(Mode.ITEM) }
@@ -750,5 +782,10 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
         /** Up to this many milliseconds between results, results are shown without any easing. */
         const val SNAP_INTERVAL_MS = 45f
         const val NOTICE_NS = 2_500_000_000L
+        const val NOTICE_NS_PER_CHARACTER = 60_000_000L
+        /** At or below this many results per second the camera is suspected... */
+        const val CAMERA_SLOW_HZ = 22
+        /** ...if it stays so for this many seconds with a hand in view. */
+        const val CAMERA_SLOW_SECONDS = 4
     }
 }

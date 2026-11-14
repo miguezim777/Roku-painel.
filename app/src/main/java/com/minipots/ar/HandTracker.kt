@@ -70,11 +70,17 @@ class HandState {
  *    and keeps its full speed for when the hand comes back.
  *  - Nothing is allocated per frame except small wrapper and result objects.
  */
-class HandTracker(
-    context: Context,
-    private val onError: (String) -> Unit,
-    private val onNotice: (String) -> Unit,
-) : ImageAnalysis.Analyzer {
+class HandTracker(context: Context, private val listener: Listener) : ImageAnalysis.Analyzer {
+    /** Called on the tracking thread. */
+    interface Listener {
+        /** Tracking cannot work at all. */
+        fun trackerError(message: String)
+        /** The GPU was asked for and could not be used; tracking continues on the CPU. */
+        fun gpuFailed()
+        /** The GPU was asked for and has produced its first results. */
+        fun gpuReady()
+    }
+
     val state = HandState()
 
     /** True for the front camera: the view is mirrored like a mirror, so landmarks are too. */
@@ -90,6 +96,12 @@ class HandTracker(
     /** Where the networks run now. */
     @Volatile var usingGpu = false
         private set
+    /** Frames in which a hand was followed since the tracker was last (re)started. */
+    @Volatile var trackedFrames = 0
+        private set
+    /** Mean cost of those frames in milliseconds. This is what CPU and GPU are compared by. */
+    @Volatile var trackedCostMs = 0f
+        private set
 
     private val appContext = context.applicationContext
     private var landmarker: HandLandmarker? = null
@@ -97,6 +109,8 @@ class HandTracker(
     private var closed = false
     private var errors = 0
     private var prioritySet = false
+    private var gpuFrames = 0
+    private var warmUp = 0
 
     private val mapping = BufferMapping()
     private var tightRows: ByteBuffer? = null
@@ -160,10 +174,17 @@ class HandTracker(
                 if (tracking && wasTracking && lastResultNs != 0L) {
                     val gap = (nowNs - lastResultNs) / 1e6f
                     intervalMs = if (intervalMs == 0f) gap else intervalMs + (gap - intervalMs) * 0.15f
+                    // The first frames after a start still compile and warm things up.
+                    if (++warmUp > WARM_UP_FRAMES) {
+                        val n = trackedFrames + 1
+                        trackedCostMs += (cost - trackedCostMs) / min(n, MEAN_WINDOW)
+                        trackedFrames = n
+                    }
                 }
             }
             lastResultNs = nowNs
             errors = 0
+            if (usingGpu && gpuFrames < GPU_READY_FRAMES && ++gpuFrames == GPU_READY_FRAMES) listener.gpuReady()
         } catch (e: Throwable) {
             loseHand()
             state.publish(null, false, System.nanoTime())
@@ -171,7 +192,7 @@ class HandTracker(
                 // The GPU path is optional: give it one more frame, then go back to the CPU.
                 if (++errors >= 2) {
                     errors = 0; preferGpu = false; closeLandmarker()
-                    onNotice("A GPU falhou neste aparelho. O rastreamento voltou para a CPU.")
+                    listener.gpuFailed()
                 }
             } else if (landmarker == null || ++errors >= MAX_CONSECUTIVE_ERRORS) {
                 // Without a tracker nothing can work; a bad frame is only fatal if it keeps happening.
@@ -190,7 +211,7 @@ class HandTracker(
 
     private fun fail(e: Throwable) {
         failed = true
-        onError("Rastreamento de mão indisponível: ${e.message ?: e.javaClass.simpleName}")
+        listener.trackerError("Rastreamento de mão indisponível: ${e.message ?: e.javaClass.simpleName}")
     }
 
     /**
@@ -207,6 +228,9 @@ class HandTracker(
     private fun closeLandmarker() {
         try { landmarker?.close() } catch (_: Exception) {}
         landmarker = null; usingGpu = false
+        // Whatever was measured belongs to the tracker that is gone.
+        trackedFrames = 0; trackedCostMs = 0f; warmUp = 0; gpuFrames = 0
+        frameCostMs = 0f; intervalMs = 0f; lastResultNs = 0L
     }
 
     /** Makes sure a tracker of the requested kind exists. Returns true when one was created now. */
@@ -220,18 +244,18 @@ class HandTracker(
                 landmarker = createLandmarker(Delegate.GPU); usingGpu = true
             } catch (e: Throwable) {
                 preferGpu = false
-                onNotice("GPU indisponível neste aparelho. O rastreamento continua na CPU.")
+                listener.gpuFailed()
             }
         }
         if (landmarker == null) landmarker = createLandmarker(Delegate.CPU)
-        frameCostMs = 0f; intervalMs = 0f; lastResultNs = 0L
         return true
     }
 
     private fun createLandmarker(delegate: Delegate): HandLandmarker {
         val options = HandLandmarker.HandLandmarkerOptions.builder()
-            // CPU (XNNPACK) by default: the GPU is left entirely to rendering, so tracking cannot
-            // lower the frame rate. The GPU is only used when the user asks for it.
+            // Starts on the CPU, where tracking cannot take frame rate from drawing. The GPU is
+            // used only after it was measured to be better on this phone (ProcessorChooser), or
+            // when the user asks for it.
             .setBaseOptions(BaseOptions.builder().setModelAssetPath(MODEL_ASSET).setDelegate(delegate).build())
             // VIDEO mode keeps MediaPipe's own tracking between frames (palm detection only runs
             // when the hand is lost) and returns the result synchronously.
@@ -343,6 +367,9 @@ class HandTracker(
     private companion object {
         const val MODEL_ASSET = "hand_landmarker.task"
         const val MAX_CONSECUTIVE_ERRORS = 5
+        const val WARM_UP_FRAMES = 5
+        const val MEAN_WINDOW = 200
+        const val GPU_READY_FRAMES = 3
         /** After this long without a hand, look for one only every [IDLE_INTERVAL_NS]. */
         const val IDLE_AFTER_NS = 1_500_000_000L
         const val IDLE_INTERVAL_NS = 60_000_000L

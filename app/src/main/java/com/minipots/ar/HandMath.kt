@@ -210,6 +210,94 @@ class PinchDetector(private val closeBelow: Float = 0.30f, private val openAbove
 }
 
 /**
+ * Decides from measurements on this phone whether the tracking networks run on the CPU or on the
+ * GPU. Which one is faster cannot be known in advance, and on a weak GPU the networks can also
+ * take frame rate away from drawing, so both are measured with a hand in view and the GPU is kept
+ * only when tracking gets clearly cheaper and the frame rate stays.
+ *
+ * [onSecond] is called once per second with the frames drawn in that second, the number of frames
+ * tracked since the tracker was (re)started and their mean cost, where the tracker runs now, and
+ * whether the GPU has been asked for. Seconds without a hand are ignored.
+ */
+class ProcessorChooser {
+    enum class Action { NONE, TRY_GPU, KEEP_GPU, KEEP_CPU }
+
+    var cpuCostMs = 0f
+        private set
+    var gpuCostMs = 0f
+        private set
+    var cpuFps = 0f
+        private set
+    var gpuFps = 0f
+        private set
+    val finished: Boolean get() = stage == DONE
+
+    private var stage = ON_CPU
+    private var lastFrames = 0
+    private var fpsSum = 0
+    private var seconds = 0
+    private var requestSeen = false
+    private var waited = 0
+
+    fun onSecond(fps: Int, trackedFrames: Int, costMs: Float, usingGpu: Boolean, gpuRequested: Boolean): Action {
+        when (stage) {
+            ON_CPU -> {
+                if (usingGpu || gpuRequested) { clear(); return Action.NONE }
+                if (!measured(fps, trackedFrames)) return Action.NONE
+                cpuCostMs = costMs; cpuFps = fpsSum.toFloat() / seconds
+                clear()
+                // Already as fast as the camera: nothing to gain, so nothing is risked.
+                if (costMs < FAST_ENOUGH_MS) { stage = DONE; return Action.KEEP_CPU }
+                stage = ON_GPU
+                return Action.TRY_GPU
+            }
+            ON_GPU -> {
+                if (!gpuRequested) {
+                    // Withdrawn after being made: the GPU could not be used.
+                    if (requestSeen || ++waited > REQUEST_GRACE_SECONDS) { stage = DONE; return Action.KEEP_CPU }
+                    return Action.NONE
+                }
+                requestSeen = true
+                if (!usingGpu) { clear(); return Action.NONE }
+                if (!measured(fps, trackedFrames)) return Action.NONE
+                gpuCostMs = costMs; gpuFps = fpsSum.toFloat() / seconds
+                stage = DONE
+                return if (gpuCostMs <= cpuCostMs * WORTH_IT && gpuFps >= cpuFps * FRAME_RATE_KEPT) Action.KEEP_GPU
+                else Action.KEEP_CPU
+            }
+        }
+        return Action.NONE
+    }
+
+    /** Counts this second if a hand was followed during it. True once there is enough to judge. */
+    private fun measured(fps: Int, trackedFrames: Int): Boolean {
+        if (trackedFrames < lastFrames) clear()
+        val followed = trackedFrames > lastFrames
+        lastFrames = trackedFrames
+        if (!followed) return false
+        fpsSum += fps; seconds++
+        return trackedFrames >= MIN_FRAMES && seconds >= MIN_SECONDS
+    }
+
+    private fun clear() { lastFrames = 0; fpsSum = 0; seconds = 0 }
+
+    companion object {
+        /** Below this cost per frame the tracker already keeps up with a 30 fps camera. */
+        const val FAST_ENOUGH_MS = 28f
+        /** The GPU has to cut the cost to this share of the CPU's. */
+        const val WORTH_IT = 0.85f
+        /** ...and leave drawing at least this share of the frame rate it had. */
+        const val FRAME_RATE_KEPT = 0.9f
+        private const val ON_CPU = 0
+        private const val ON_GPU = 1
+        private const val DONE = 2
+        private const val MIN_FRAMES = 20
+        private const val MIN_SECONDS = 3
+        private const val REQUEST_GRACE_SECONDS = 5
+    }
+}
+
+/**
  * Relations between a camera buffer (as delivered by the sensor) and the upright image the user
  * sees. `rotation` is the clockwise rotation in degrees that makes the buffer upright, exactly as
  * reported by CameraX. (p, q) are fractions along the buffer x / y axes; (a, b) are fractions

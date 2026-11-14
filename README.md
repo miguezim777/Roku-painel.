@@ -20,12 +20,16 @@ Tocar na tela continua funcionando exatamente como a pinça.
 
 No canto superior direito ficam os números de desempenho: `fps` da tela, `mão N Hz` (resultados de rastreamento por segundo), o custo em milissegundos de cada quadro rastreado e onde as redes estão rodando (`CPU` ou `GPU`).
 
-O botão **CPU ⇄ GPU** troca o processador do rastreamento. O padrão é a CPU. Em alguns aparelhos a GPU é bem mais rápida; em GPU fraca ela é mais lenta e ainda pode tirar fps do desenho. Teste e compare os números: se o `ms` cair e o `fps` não, fique na GPU. Se a GPU não puder ser usada, o app volta para a CPU sozinho. A escolha não é guardada entre execuções.
+**CPU ou GPU é escolhido pelo próprio app, medindo no seu aparelho.** Com a mão à vista, ele mede por alguns segundos quanto custa cada quadro na CPU. Se a CPU já acompanha a câmera (menos de 28 ms por quadro), fica nela. Se não, ele testa a GPU: o esqueleto da mão fica parado por alguns segundos enquanto a GPU é preparada, e depois a medição se repete. A GPU só fica se o custo por quadro cair pelo menos 15% **e** o `fps` do jogo não cair mais de 10%; senão o app volta para a CPU. Um aviso mostra os números medidos e a escolha fica guardada para as próximas vezes.
+
+O botão **CPU ⇄ GPU** troca na mão, encerra a medição automática e também fica guardado. Se a GPU não puder ser usada, o app volta para a CPU sozinho; se o app fechar enquanto a GPU é ligada (driver com defeito), na próxima abertura ele fica na CPU e avisa. Para repetir a medição automática, limpe os dados do app.
+
+Se o custo por quadro é baixo e mesmo assim `mão N Hz` fica em 22 ou menos, quem limita é a câmera (ela reduz as imagens por segundo com pouca luz). O app avisa quando percebe isso: mais luz resolve, trocar de processador não.
 
 ## Como o rastreamento foi pensado para celular fraco
 
 - **A tela nunca espera a mão.** O rastreamento roda em uma thread própria, com prioridade logo abaixo da de desenho e acima do resto do app, e só publica o resultado mais recente. O desenho lê esse resultado sem bloquear. Se a inferência ficar lenta, cai o `Hz` da mão, não o `fps`.
-- **Inferência na CPU (XNNPACK) por padrão, GPU só para desenhar.** Em GPU fraca, dividir a GPU com o modelo derruba o fps; por isso a GPU é opcional (botão **CPU ⇄ GPU**).
+- **A GPU só roda o modelo se isso não custar fps.** Em GPU fraca, dividir a GPU com o modelo derruba o fps; por isso o app começa na CPU e só passa para a GPU depois de medir que o rastreamento ficou mais rápido e o fps se manteve.
 - **Nenhuma cópia de imagem no caminho.** O quadro da câmera vai direto para o MediaPipe, sem bitmap e sem cópia girada: a rotação é só um parâmetro do recorte que o MediaPipe já faz.
 - **Modelo carregado na abertura.** O modelo é carregado enquanto a câmera abre, não no primeiro quadro.
 - **Sempre o quadro mais novo.** A análise usa `STRATEGY_KEEP_ONLY_LATEST`: quadros nunca entram em fila, então o resultado nunca descreve uma imagem velha.

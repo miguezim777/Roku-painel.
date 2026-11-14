@@ -289,4 +289,107 @@ class HandMathTest {
             }
         }
     }
+
+    // ---------------------------------------------------------------- CPU or GPU
+
+    private val none = ProcessorChooser.Action.NONE
+
+    /** Three seconds with a hand on a CPU that takes 70 ms per frame: the GPU gets its chance. */
+    private fun slowCpu(c: ProcessorChooser) {
+        assertEquals(none, c.onSecond(60, 14, 70f, false, false))
+        assertEquals(none, c.onSecond(60, 28, 70f, false, false))
+        assertEquals(ProcessorChooser.Action.TRY_GPU, c.onSecond(60, 42, 70f, false, false))
+        assertEquals(70f, c.cpuCostMs, 1e-3f); assertEquals(60f, c.cpuFps, 1e-3f)
+        // The request takes a moment to arrive, and the GPU takes seconds to start.
+        assertEquals(none, c.onSecond(60, 0, 0f, false, false))
+        assertEquals(none, c.onSecond(60, 0, 0f, false, true))
+    }
+
+    /** Three seconds with a hand on the GPU, at the given cost and frame rate. */
+    private fun onGpu(c: ProcessorChooser, costMs: Float, fps: Int): ProcessorChooser.Action {
+        assertEquals(none, c.onSecond(fps, 25, costMs, true, true))
+        assertEquals(none, c.onSecond(fps, 50, costMs, true, true))
+        return c.onSecond(fps, 75, costMs, true, true)
+    }
+
+    @Test fun cpuThatKeepsUpWithTheCameraIsNotPutAtRisk() {
+        val c = ProcessorChooser()
+        assertEquals(none, c.onSecond(60, 30, 20f, false, false))
+        assertEquals(none, c.onSecond(60, 60, 20f, false, false))
+        assertEquals(ProcessorChooser.Action.KEEP_CPU, c.onSecond(60, 90, 20f, false, false))
+        assertTrue(c.finished)
+        assertEquals(0f, c.gpuCostMs, 0f)
+    }
+
+    @Test fun fasterGpuIsKept() {
+        val c = ProcessorChooser()
+        slowCpu(c)
+        assertEquals(ProcessorChooser.Action.KEEP_GPU, onGpu(c, 30f, 60))
+        assertTrue(c.finished)
+        assertEquals(30f, c.gpuCostMs, 1e-3f)
+    }
+
+    @Test fun gpuThatIsNotClearlyFasterIsDropped() {
+        val c = ProcessorChooser()
+        slowCpu(c)
+        assertEquals(ProcessorChooser.Action.KEEP_CPU, onGpu(c, 65f, 60))
+        assertEquals(65f, c.gpuCostMs, 1e-3f)
+    }
+
+    @Test fun gpuThatTakesFrameRateFromTheGameIsDropped() {
+        val c = ProcessorChooser()
+        slowCpu(c)
+        assertEquals(ProcessorChooser.Action.KEEP_CPU, onGpu(c, 30f, 40))
+        assertEquals(40f, c.gpuFps, 1e-3f)
+    }
+
+    @Test fun gpuThatFailsLeavesTheCpu() {
+        val c = ProcessorChooser()
+        slowCpu(c)
+        // The tracker withdrew the request: the GPU could not be used.
+        assertEquals(ProcessorChooser.Action.KEEP_CPU, c.onSecond(60, 0, 0f, false, false))
+        assertTrue(c.finished)
+        assertEquals(0f, c.gpuCostMs, 0f)
+    }
+
+    @Test fun requestThatNeverArrivesEndsTheTrial() {
+        val c = ProcessorChooser()
+        assertEquals(none, c.onSecond(60, 14, 70f, false, false))
+        assertEquals(none, c.onSecond(60, 28, 70f, false, false))
+        assertEquals(ProcessorChooser.Action.TRY_GPU, c.onSecond(60, 42, 70f, false, false))
+        var action = none
+        var seconds = 0
+        while (action == none && seconds < 20) { action = c.onSecond(60, 56 + seconds * 14, 70f, false, false); seconds++ }
+        assertEquals(ProcessorChooser.Action.KEEP_CPU, action)
+        assertTrue(seconds in 2..10)
+    }
+
+    @Test fun secondsWithoutAHandAreNotMeasured() {
+        val c = ProcessorChooser()
+        repeat(30) { assertEquals(none, c.onSecond(10, 0, 0f, false, false)) }
+        assertFalse(c.finished)
+        assertEquals(none, c.onSecond(60, 14, 70f, false, false))
+        // The hand leaves: the count of tracked frames stands still, and so does the judgement.
+        repeat(5) { assertEquals(none, c.onSecond(10, 14, 70f, false, false)) }
+        assertEquals(none, c.onSecond(60, 28, 70f, false, false))
+        assertEquals(ProcessorChooser.Action.TRY_GPU, c.onSecond(60, 42, 70f, false, false))
+        // Only the seconds with a hand count for the frame rate the GPU will be held to.
+        assertEquals(60f, c.cpuFps, 1e-3f)
+    }
+
+    @Test fun restartedTrackerIsMeasuredFromTheStart() {
+        val c = ProcessorChooser()
+        assertEquals(none, c.onSecond(60, 14, 70f, false, false))
+        assertEquals(none, c.onSecond(60, 28, 70f, false, false))
+        // The count starts again (camera switched, tracker recreated).
+        assertEquals(none, c.onSecond(60, 5, 70f, false, false))
+        assertEquals(none, c.onSecond(60, 19, 70f, false, false))
+        assertEquals(ProcessorChooser.Action.TRY_GPU, c.onSecond(60, 33, 70f, false, false))
+    }
+
+    @Test fun chooserStaysOutWhileTheGpuWasChosenByHand() {
+        val c = ProcessorChooser()
+        repeat(10) { assertEquals(none, c.onSecond(60, 30 * (it + 1), 70f, true, true)) }
+        assertFalse(c.finished)
+    }
 }

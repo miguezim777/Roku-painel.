@@ -1,6 +1,7 @@
 package com.minipots.ar
 
 import android.Manifest
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.opengl.GLSurfaceView
@@ -35,13 +36,14 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
-class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
+class MainActivity : ComponentActivity(), RoomRenderer.Callbacks, HandTracker.Listener {
     private lateinit var surface: GLSurfaceView
     private lateinit var renderer: RoomRenderer
     private lateinit var tracker: HandTracker
     private lateinit var status: TextView
     private lateinit var stats: TextView
     private lateinit var analysisExecutor: ExecutorService
+    private lateinit var settings: SharedPreferences
     private var cameraProvider: ProcessCameraProvider? = null
     private var frontCamera = false
     private var lastStatus = ""
@@ -61,8 +63,19 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN
 
         analysisExecutor = Executors.newSingleThreadExecutor { Thread(it, "hand-tracking") }
-        tracker = HandTracker(this, { message -> renderer.setTrackerError(message) }, { message -> renderer.showNotice(message) })
-        renderer = RoomRenderer(tracker, this)
+        settings = getSharedPreferences("settings", MODE_PRIVATE)
+        var processor = settings.getString(KEY_PROCESSOR, PROCESSOR_AUTO)
+        val gpuClosedTheApp = settings.getBoolean(KEY_GPU_STARTING, false)
+        if (gpuClosedTheApp) {
+            // The mark is written before the GPU is started and removed once it works. Finding it
+            // here means the app died in between, so the GPU is not tried again by itself.
+            processor = PROCESSOR_CPU
+            settings.edit().putString(KEY_PROCESSOR, PROCESSOR_CPU).putBoolean(KEY_GPU_STARTING, false).commit()
+        }
+        tracker = HandTracker(this, this)
+        renderer = RoomRenderer(tracker, this, chooseProcessor = processor == PROCESSOR_AUTO)
+        if (processor == PROCESSOR_GPU) startGpu()
+        if (gpuClosedTheApp) renderer.showNotice("Da última vez o app fechou ao usar a GPU. O rastreamento fica na CPU.")
         // The model loads while the camera opens, instead of on the first frame.
         analysisExecutor.execute { tracker.prepare() }
         surface = GLSurfaceView(this).apply {
@@ -148,6 +161,64 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
     override fun stats(text: String) { runOnUiThread { stats.text = text } }
     override fun contextLost() { runOnUiThread { bindCamera() } }
 
+    override fun processor(action: ProcessorChooser.Action, cpuMs: Float, gpuMs: Float, cpuFps: Float, gpuFps: Float) {
+        runOnUiThread {
+            val cpu = cpuMs.roundToInt(); val gpu = gpuMs.roundToInt()
+            when (action) {
+                ProcessorChooser.Action.TRY_GPU -> {
+                    startGpu()
+                    renderer.showNotice("A CPU leva $cpu ms por quadro da mão. Testando a GPU: o esqueleto da mão fica parado por alguns segundos. Depois, mantenha a mão à vista.")
+                }
+                ProcessorChooser.Action.KEEP_GPU -> {
+                    saveProcessor(PROCESSOR_GPU)
+                    renderer.showNotice("Rastreamento na GPU: $gpu ms por quadro, contra $cpu ms na CPU.")
+                }
+                ProcessorChooser.Action.KEEP_CPU -> {
+                    tracker.preferGpu = false
+                    saveProcessor(PROCESSOR_CPU)
+                    // gpuMs is 0 when the GPU was not measured: not needed, or it failed (said elsewhere).
+                    if (gpuMs > 0f) renderer.showNotice(
+                        if (gpuFps < cpuFps * ProcessorChooser.FRAME_RATE_KEPT)
+                            "Na GPU o jogo caiu de ${cpuFps.roundToInt()} para ${gpuFps.roundToInt()} fps. O rastreamento fica na CPU ($cpu ms por quadro; na GPU, $gpu ms)."
+                        else "A GPU não ajudou neste aparelho: $gpu ms por quadro, contra $cpu ms na CPU. O rastreamento fica na CPU."
+                    )
+                }
+                ProcessorChooser.Action.NONE -> {}
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- HandTracker.Listener (tracking thread)
+
+    override fun trackerError(message: String) { renderer.setTrackerError(message) }
+
+    override fun gpuFailed() {
+        runOnUiThread {
+            saveProcessor(PROCESSOR_CPU)
+            renderer.showNotice("GPU indisponível neste aparelho. O rastreamento continua na CPU.")
+        }
+    }
+
+    override fun gpuReady() { runOnUiThread { settings.edit().putBoolean(KEY_GPU_STARTING, false).apply() } }
+
+    // ---------------------------------------------------------------- CPU or GPU
+
+    /**
+     * Starting the networks on the GPU can close the app on phones with a faulty driver, and that
+     * cannot be caught. So a mark is saved first (synchronously: it has to survive the crash) and
+     * removed when the GPU delivers results; see [onCreate] for what happens if it is found.
+     */
+    private fun startGpu() {
+        settings.edit().putBoolean(KEY_GPU_STARTING, true).commit()
+        tracker.preferGpu = true
+    }
+
+    private fun saveProcessor(processor: String) {
+        val edit = settings.edit().putString(KEY_PROCESSOR, processor)
+        if (processor == PROCESSOR_CPU) edit.putBoolean(KEY_GPU_STARTING, false)
+        edit.apply()
+    }
+
     private fun showStatus(message: String) { if (lastStatus != message) { lastStatus = message; status.text = message } }
 
     // ---------------------------------------------------------------- camera
@@ -183,15 +254,17 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
     }
 
     /**
-     * Moves the tracking networks between CPU and GPU. Which one is faster depends on the phone;
-     * the numbers at the top right show the result. The tracker returns to the CPU by itself if
-     * the GPU cannot be used.
+     * Moves the tracking networks between CPU and GPU by hand. This ends the automatic comparison
+     * and the choice is kept for the next launches. The tracker still returns to the CPU by itself
+     * if the GPU cannot be used.
      */
     private fun switchProcessor() {
         val gpu = !tracker.preferGpu
-        tracker.preferGpu = gpu
+        surface.queueEvent { renderer.stopChoosingProcessor() }
+        if (gpu) startGpu() else tracker.preferGpu = false
+        saveProcessor(if (gpu) PROCESSOR_GPU else PROCESSOR_CPU)
         renderer.showNotice(
-            if (gpu) "Testando o rastreamento na GPU… Compare os números no canto: se o fps cair, volte para a CPU."
+            if (gpu) "Rastreamento na GPU. Compare os números no canto: se o fps cair, volte para a CPU."
             else "Rastreamento na CPU."
         )
     }
@@ -255,6 +328,13 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
         super.onPause()
     }
 
+    override fun onStop() {
+        // Still alive, so the GPU did not close the app. Without this, leaving before the GPU has
+        // delivered a result would be taken for a crash on the next launch.
+        settings.edit().putBoolean(KEY_GPU_STARTING, false).apply()
+        super.onStop()
+    }
+
     override fun onDestroy() {
         cameraProvider?.unbindAll()
         // After unbinding no more frames arrive; the tracker is closed on its own thread.
@@ -265,5 +345,10 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
 
     private companion object {
         const val MAX_RENDER_WIDTH = 720
+        const val KEY_PROCESSOR = "processor"
+        const val KEY_GPU_STARTING = "gpu_starting"
+        const val PROCESSOR_AUTO = "auto"
+        const val PROCESSOR_CPU = "cpu"
+        const val PROCESSOR_GPU = "gpu"
     }
 }
