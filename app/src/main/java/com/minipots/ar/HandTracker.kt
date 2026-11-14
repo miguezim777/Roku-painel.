@@ -208,10 +208,8 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
             src.copyPixelsFromBuffer(pixels)
         } else {
             // Rows are padded on this device: pack them first.
-            var tight = tightRows
-            if (tight == null || tight.capacity() != rowBytes * height) {
-                tight = ByteBuffer.allocateDirect(rowBytes * height); tightRows = tight
-            }
+            val tight = tightRows?.takeIf { it.capacity() == rowBytes * height }
+                ?: ByteBuffer.allocateDirect(rowBytes * height).also { tightRows = it }
             tight.clear()
             for (y in 0 until height) {
                 pixels.limit(y * plane.rowStride + rowBytes)

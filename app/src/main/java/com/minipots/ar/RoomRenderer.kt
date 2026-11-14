@@ -711,6 +711,7 @@ class RoomRenderer(private val tracker: HandTracker, private val callbacks: Call
         }
         selectedPot?.let { p ->
             if (p === dragPot) { dragPot = null; dragging = false }
+            if (dragItem?.pot === p) { dragItem = null; dragging = false }
             pots.remove(p); selectedPot = null
         }
     }

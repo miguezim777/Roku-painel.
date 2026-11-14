@@ -144,9 +144,7 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
 
     // ---------------------------------------------------------------- camera
 
-    @Deprecated("Deprecated in Java")
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
-        @Suppress("DEPRECATION")
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, results: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, results)
         if (requestCode != CAMERA_REQUEST) return
         if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) startCamera()
