@@ -24,8 +24,14 @@ const val HAND_POINTS = 21
 class HandSample {
     /** x, y pairs in normalized view coordinates (0..1, y down). May lie slightly outside 0..1. */
     val points = FloatArray(HAND_POINTS * 2)
+    /** x, y, z triples in camera space (x right, y up, z towards the viewer), in metres, around the middle of the hand. */
+    val shape = FloatArray(HAND_POINTS * 3)
     var present = false
     var pinch = false
+    /** The hand is closed into a fist. */
+    var closed = false
+    /** Distance from the camera to the hand in metres, estimated from its size in the picture. */
+    var depth = 0f
     var sequence = 0
     var timeNs = 0L
 }
@@ -34,11 +40,14 @@ class HandSample {
 class HandState {
     private val latest = HandSample()
 
-    fun publish(points: FloatArray?, pinch: Boolean, timeNs: Long) {
+    fun publish(points: FloatArray?, pinch: Boolean, timeNs: Long, shape: FloatArray? = null, closed: Boolean = false, depth: Float = 0f) {
         synchronized(latest) {
             if (points != null) System.arraycopy(points, 0, latest.points, 0, latest.points.size)
+            if (shape != null) System.arraycopy(shape, 0, latest.shape, 0, latest.shape.size)
             latest.present = points != null
             latest.pinch = points != null && pinch
+            latest.closed = points != null && closed
+            if (points != null) latest.depth = depth
             latest.timeNs = timeNs
             latest.sequence++
         }
@@ -48,7 +57,9 @@ class HandState {
         synchronized(latest) {
             if (out.sequence != latest.sequence) {
                 System.arraycopy(latest.points, 0, out.points, 0, out.points.size)
+                System.arraycopy(latest.shape, 0, out.shape, 0, out.shape.size)
                 out.present = latest.present; out.pinch = latest.pinch
+                out.closed = latest.closed; out.depth = latest.depth
                 out.timeNs = latest.timeNs; out.sequence = latest.sequence
             }
         }
@@ -121,6 +132,14 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
     private val filtered = FloatArray(HAND_POINTS * 2)
     private val filters = Array(HAND_POINTS * 2) { OneEuroFilter(MIN_CUTOFF_HZ, BETA, DERIVATIVE_CUTOFF_HZ) }
     private val pinch = PinchDetector()
+    // The hand in 3D, for games that draw it as a solid hand.
+    private val shapeRaw = FloatArray(HAND_POINTS * 3)
+    private val shape = FloatArray(HAND_POINTS * 3)
+    private val shapeFilters = Array(HAND_POINTS * 3) { OneEuroFilter(1f, 8f, 1.5f) }
+    private val depthFilter = OneEuroFilter(.8f, 5f, 1.5f)
+    private val fist = PinchDetector(HandShape.CLOSED_BELOW, HandShape.OPEN_ABOVE)
+    private var depth = 0f
+    private var uprightRotation = 0
     private var tracking = false
     private var lastTimestampMs = 0L
     private var lastSampleNs = 0L
@@ -157,6 +176,7 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
             val rotation = image.imageInfo.rotationDegrees
             val crop = image.cropRect
             mapping.update(width, height, crop.left, crop.top, crop.right, crop.bottom, rotation, mirror)
+            uprightRotation = rotation
             val frameNs = image.imageInfo.timestamp
             val timestampMs = max(lastTimestampMs + 1, SystemClock.uptimeMillis())
             lastTimestampMs = timestampMs
@@ -308,8 +328,10 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
 
     private fun loseHand() {
         if (!tracking) return
-        tracking = false; pinch.reset()
+        tracking = false; pinch.reset(); fist.reset()
         for (f in filters) f.reset()
+        for (f in shapeFilters) f.reset()
+        depthFilter.reset()
     }
 
     private fun publish(result: HandLandmarkerResult, nowNs: Long, frameNs: Long) {
@@ -353,8 +375,28 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
             val gap = distance(thumb.x() - index.x(), thumb.y() - index.y(), thumb.z() - index.z())
             val size = distance(wrist.x() - knuckle.x(), wrist.y() - knuckle.y(), wrist.z() - knuckle.z())
             pinched = pinch.update(gap / max(size, 0.03f))
+
+            // The same landmarks as a shape in camera space, steadied like the screen positions.
+            val turned = uprightRotation; val mirrored = mirror
+            for (i in 0 until HAND_POINTS) {
+                val p = w[i]
+                HandShape.toCameraSpace(turned, mirrored, p.x(), p.y(), p.z(), shapeRaw, i * 3)
+            }
+            for (i in shape.indices) shape[i] = shapeFilters[i].filter(shapeRaw[i], dt, SHAPE_SPEED_SCALE)
+            fist.update(HandShape.closedRatio(shapeRaw))
+            // How far the hand is: its real size across the picture against its size in the
+            // picture. Depth inside the hand is left out on both sides, so a hand that points at
+            // the camera is not taken for a distant one.
+            var real = 0f; var seen = 0f
+            for (i in 0 until DEPTH_PAIRS.size / 2) {
+                val a = DEPTH_PAIRS[i * 2]; val b = DEPTH_PAIRS[i * 2 + 1]
+                real += HandShape.flatDistance(shapeRaw, a, b); seen += screenDistance(a, b, aspect)
+            }
+            if (seen > 1e-3f && real > 1e-3f) {
+                depth = depthFilter.filter((FOCAL_LENGTH * real / seen).coerceIn(MIN_DEPTH, MAX_DEPTH), dt, DEPTH_SPEED_SCALE)
+            }
         }
-        state.publish(filtered, pinched, nowNs)
+        state.publish(filtered, pinched, nowNs, shape, fist.pinched, depth)
     }
 
     private fun screenDistance(a: Int, b: Int, aspect: Float): Float {
@@ -376,6 +418,15 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
         // One Euro filter, with speed in hand sizes per second. Chosen by simulation at 15 and 30
         // results per second: a still hand keeps 40% of its jitter, and a hand that starts moving
         // is followed within about 2% of its own size, at any speed.
+        /** The 3D shape is in metres; the filter wants hand sizes (about 9 cm) per second. */
+        const val SHAPE_SPEED_SCALE = 11f
+        const val DEPTH_SPEED_SCALE = 5f
+        /** Focal length of a phone camera in units of the long side of its picture. */
+        const val FOCAL_LENGTH = .77f
+        const val MIN_DEPTH = .15f
+        const val MAX_DEPTH = 1.0f
+        /** Pairs of landmarks across the palm, whose distances give the size of the hand. */
+        val DEPTH_PAIRS = intArrayOf(0, 9, 5, 17, 0, 5, 0, 17)
         const val MIN_CUTOFF_HZ = 1.2f
         const val BETA = 20f
         const val DERIVATIVE_CUTOFF_HZ = 2f

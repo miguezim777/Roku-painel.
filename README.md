@@ -26,6 +26,25 @@ O botão **CPU ⇄ GPU** troca na mão, encerra a medição automática e també
 
 Se o custo por quadro é baixo e mesmo assim `mão N Hz` fica em 22 ou menos, quem limita é a câmera (ela reduz as imagens por segundo com pouca luz). O app avisa quando percebe isso: mais luz resolve, trocar de processador não.
 
+## Coliseu
+
+O botão **Coliseu** (última fileira do Mini Pots) abre um segundo jogo; o botão **Potinhos** volta. Nele a imagem da câmera não aparece: a tela mostra só a arena, e a câmera serve para seguir **uma mão**, desenhada em 3D na cor da pele na ponta de um braço comprido.
+
+![Arena do Coliseu com a espada na mão](docs/coliseu.png)
+
+*Imagem gerada no computador pelo código de desenho do próprio jogo, com uma mão de teste. Não é captura de tela de um celular.*
+
+- **Andar (como no Gorilla Tag):** não há pernas nem botão de andar. Olhe para o chão, encoste a mão nele (aparece um círculo claro embaixo da mão) e puxe: o corpo vai para o lado contrário ao da mão. Puxar para trás anda para frente, empurrar para baixo levanta o corpo, e um empurrão rápido vira pulo ou deslize. A sombra da mão mostra a que altura ela está.
+- **Pegar:** feche a mão sobre a espada, o machado ou a maça fincados na areia. A arma fica na mão, ao longo dos nós dos dedos, até você mostrar a mão aberta por um instante. Se a câmera perder a mão no meio de um golpe, a arma não cai.
+- **Bater:** balance a arma através de um boneco de palha. Só conta golpe rápido; encostar devagar não faz nada. Três golpes (ou menos, se forem fortes) desmontam o boneco, que volta depois de 4 segundos. O celular vibra de leve a cada golpe, se a vibração de toque estiver ligada no sistema.
+- **Olhar em volta** — o botão **Olhar** alterna entre os modos que o aparelho permite, e a escolha fica guardada:
+  - **giroscópio:** a vista acompanha o celular; arrastar o dedo na tela também vira, para não precisar girar o corpo;
+  - **inclinar + dedo** (para quem **não tem giroscópio**): o acelerômetro diz o quanto o celular está inclinado para cima ou para baixo, e arrastar o dedo vira para os lados;
+  - **dedo:** arrastar o dedo faz tudo. Funciona em qualquer aparelho.
+- **Recomeçar** devolve você ao portão, as armas à areia e faz da direção atual do celular a "frente".
+
+O cenário é simples de propósito: areia, muro, arquibancada, portão, duas bandeiras, sol e nuvem. A arena inteira é uma chamada de desenho e o céu é outra.
+
 ## Como o rastreamento foi pensado para celular fraco
 
 - **A tela nunca espera a mão.** O rastreamento roda em uma thread própria, com prioridade logo abaixo da de desenho e acima do resto do app, e só publica o resultado mais recente. O desenho lê esse resultado sem bloquear. Se a inferência ficar lenta, cai o `Hz` da mão, não o `fps`.
@@ -48,6 +67,8 @@ Se o custo por quadro é baixo e mesmo assim `mão N Hz` fica em 22 ou menos, qu
 A qualidade depende da luz: com pouca luz a câmera borra o movimento e o rastreamento piora. Como não há mapeamento de ambiente, a mesa é fixa em relação à tela, não a uma superfície real. O movimento dos objetos é uma aproximação simples com gravidade e quique; não há colisão entre objetos nem oclusão pela mão real.
 
 O rastreamento não pôde ser testado em aparelho neste repositório: a compilação e os testes de unidade rodam no GitHub Actions, mas os números de fps e Hz precisam ser conferidos no seu celular (eles aparecem na tela).
+
+O Coliseu também não foi jogado em aparelho. As regras (andar, pegar, soltar, golpes, modos de olhar) têm testes de unidade, e o desenho foi conferido no computador com um substituto da GPU, mas três coisas só o celular mostra: se a distância da mão, estimada pelo tamanho dela na imagem, deixa o chão fácil de alcançar; se a mão 3D aparece virada do jeito certo nas duas câmeras; e se os sensores de cada aparelho dão a direção esperada.
 
 ## Compilação
 
