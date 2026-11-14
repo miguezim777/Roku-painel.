@@ -14,18 +14,41 @@ jobs:
           distribution: temurin
           java-version: '17'
       - name: Unit tests
-        run: ./gradlew --no-daemon testDebugUnitTest
-      - name: Build debug APK
-        run: ./gradlew --no-daemon assembleDebug
-      - name: Check APK contents
+        shell: bash
         run: |
-          apk=app/build/outputs/apk/debug/app-debug.apk
-          unzip -l "$apk" > apk-contents.txt
-          grep -E "assets/|lib/" apk-contents.txt || true
-          for entry in assets/hand_landmarker.task lib/arm64-v8a/libmediapipe_tasks_vision_jni.so lib/armeabi-v7a/libmediapipe_tasks_vision_jni.so; do
-            grep -q " $entry\$" apk-contents.txt || { echo "missing from APK: $entry"; exit 1; }
-          done
-          ls -l "$apk"
+          set -o pipefail
+          ./gradlew --no-daemon testDebugUnitTest 2>&1 | tee -a build.log
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon assembleDebug 2>&1 | tee -a build.log
+      - name: Check APK contents
+        shell: bash
+        run: |
+          set -o pipefail
+          {
+            apk=app/build/outputs/apk/debug/app-debug.apk
+            unzip -l "$apk" > apk-contents.txt
+            grep -E "assets/|lib/" apk-contents.txt || true
+            ls -l "$apk"
+            for entry in assets/hand_landmarker.task lib/arm64-v8a/libmediapipe_tasks_vision_jni.so lib/armeabi-v7a/libmediapipe_tasks_vision_jni.so; do
+              grep -q " $entry\$" apk-contents.txt || { echo "error: missing from APK: $entry"; exit 1; }
+            done
+          } 2>&1 | tee -a build.log
+      # Shows the reason for a failure on the run page itself, without opening the full log.
+      - name: Report failure
+        if: failure()
+        shell: bash
+        run: |
+          {
+            grep -hE "^e: |^w: |error:|FAILED|What went wrong|Could not|missing from APK|assets/|lib/" -A 4 build.log | head -n 120
+            for report in app/build/test-results/testDebugUnitTest/*.xml; do
+              [ -f "$report" ] && grep -hE "<testcase|<failure|Error|expected" "$report" | grep -B1 -A3 "<failure" | cut -c1-400 | head -n 80
+            done
+          } > failure.txt || true
+          message=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' failure.txt | awk '{ printf "%s%%0A", $0 }')
+          echo "::error title=Build failure::${message}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
