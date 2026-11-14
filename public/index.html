@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0d0b18" />
+    <title>Roku Painel · Controle por gestos</title>
+    <meta
+      name="description"
+      content="Painel de controle do Roku por rastreamento de mão no navegador: gestures, direcional, atalhos e telemetria."
+    />
+    <link rel="stylesheet" href="/css/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c5cff'/%3E%3Ctext x='16' y='23' font-size='18' text-anchor='middle' fill='white'%3E%E2%9C%8B%3C/text%3E%3C/svg%3E"
+    />
+    <script src="/vendor/mediapipe/hands/hands.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#painel">Ir para o painel</a>
+
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">✋</div>
+        <div class="brand-text">
+          <h1>Roku Painel</h1>
+          <p>Controle o Roku com a mão, em tempo real</p>
+        </div>
+      </div>
+
+      <div class="status-row" aria-live="polite">
+        <span class="chip" id="chip-camera" data-state="off">
+          <i class="dot"></i><span id="chip-camera-text">Câmera desligada</span>
+        </span>
+        <span class="chip" id="chip-roku" data-state="off">
+          <i class="dot"></i><span id="chip-roku-text">Roku desconectado</span>
+        </span>
+        <span class="chip chip-mono" id="chip-fps">— fps</span>
+      </div>
+
+      <div class="topbar-actions">
+        <button class="btn btn-ghost" id="btn-connect" type="button">
+          <span aria-hidden="true">📡</span> Conectar Roku
+        </button>
+        <button class="btn btn-ghost" id="btn-settings" type="button" aria-haspopup="dialog">
+          <span aria-hidden="true">⚙️</span> Ajustes
+        </button>
+      </div>
+    </header>
+
+    <main class="layout" id="painel">
+      <!-- ---------------------------------------------------------------- stage -->
+      <section class="card stage" aria-label="Rastreamento de mão">
+        <div class="card-head">
+          <h2>Rastreamento de mão</h2>
+          <div class="segmented" role="group" aria-label="Fonte do vídeo">
+            <button type="button" data-mode="camera" class="seg-btn is-active" id="mode-camera">
+              Câmera
+            </button>
+            <button type="button" data-mode="demo" class="seg-btn" id="mode-demo">Demo</button>
+          </div>
+        </div>
+
+        <div class="video-wrap">
+          <video id="video" playsinline muted hidden></video>
+          <canvas id="canvas" width="960" height="540" aria-label="Prévia com esqueleto da mão"></canvas>
+
+          <div class="video-overlay">
+            <div class="gesture-badge" id="gesture-badge" data-gesture="none">
+              <span class="gesture-emoji" id="gesture-emoji">🫥</span>
+              <span class="gesture-text">
+                <strong id="gesture-name">Sem mão</strong>
+                <small id="gesture-hint">Mostre a mão para a câmera</small>
+              </span>
+            </div>
+            <div class="hand-chips">
+              <span class="pill" id="hand-label">—</span>
+              <span class="pill" id="latency">0 ms</span>
+            </div>
+          </div>
+
+          <div class="start-overlay" id="start-overlay">
+            <p class="start-title">Ative o rastreamento</p>
+            <p class="start-sub">
+              Nada sai do seu computador: o MediaPipe roda dentro do navegador com os
+              arquivos servidos localmente.
+            </p>
+            <div class="start-actions">
+              <button class="btn btn-primary" id="btn-start-camera" type="button">
+                Ativar câmera
+              </button>
+              <button class="btn btn-ghost" id="btn-start-demo" type="button">
+                Ver modo demo
+              </button>
+            </div>
+            <p class="start-hint" id="start-hint"></p>
+          </div>
+        </div>
+
+        <div class="fingers-row" aria-label="Dedos detectados">
+          <span class="finger" data-finger="thumb">Polegar</span>
+          <span class="finger" data-finger="index">Indicador</span>
+          <span class="finger" data-finger="middle">Médio</span>
+          <span class="finger" data-finger="ring">Anelar</span>
+          <span class="finger" data-finger="pinky">Mínimo</span>
+          <span class="pinch-meter">
+            <span>pinça</span>
+            <span class="meter"><i id="pinch-bar"></i></span>
+          </span>
+        </div>
+      </section>
+
+      <!-- ----------------------------------------------------------------- tv -->
+      <section class="card tv" aria-label="Roku">
+        <div class="card-head">
+          <h2>Televisão</h2>
+          <span class="muted" id="tv-mode">—</span>
+        </div>
+
+        <div class="tv-screen" id="tv-screen" data-key="">
+          <div class="tv-noise" aria-hidden="true"></div>
+          <div class="tv-content">
+            <span class="tv-app" id="tv-app">Roku</span>
+            <span class="tv-key" id="tv-key">Pronto</span>
+            <span class="tv-source" id="tv-source"></span>
+          </div>
+        </div>
+
+        <div class="remote" role="group" aria-label="Controle remoto">
+          <div class="remote-top">
+            <button class="btn-ico" data-key="Back" title="Voltar">↩</button>
+            <button class="btn-ico" data-key="Home" title="Início">🏠</button>
+            <button class="btn-ico" data-key="Info" title="Informações">ⓘ</button>
+          </div>
+
+          <div class="dpad">
+            <button class="dpad-btn up" data-key="Up" title="Cima">▲</button>
+            <button class="dpad-btn left" data-key="Left" title="Esquerda">◀</button>
+            <button class="dpad-btn ok" data-key="Select" title="OK">OK</button>
+            <button class="dpad-btn right" data-key="Right" title="Direita">▶</button>
+            <button class="dpad-btn down" data-key="Down" title="Baixo">▼</button>
+          </div>
+
+          <div class="remote-bottom">
+            <button class="btn-ico" data-key="Rev" title="Retroceder">⏪</button>
+            <button class="btn-ico" data-key="Play" title="Play/Pause">⏯</button>
+            <button class="btn-ico" data-key="Fwd" title="Avançar">⏩</button>
+          </div>
+
+          <div class="remote-volume">
+            <button class="btn-ico" data-key="VolumeDown" title="Volume −">🔉</button>
+            <button class="btn-ico" data-key="VolumeMute" title="Mudo">🔇</button>
+            <button class="btn-ico" data-key="VolumeUp" title="Volume +">🔊</button>
+          </div>
+        </div>
+
+        <div class="apps" id="apps" aria-label="Aplicativos"></div>
+      </section>
+
+      <!-- --------------------------------------------------------------- log -->
+      <section class="card log" aria-label="Histórico de comandos">
+        <div class="card-head">
+          <h2>Histórico</h2>
+          <button class="btn btn-link" id="btn-clear-log" type="button">limpar</button>
+        </div>
+        <ol class="log-list" id="log-list"></ol>
+      </section>
+
+      <!-- ----------------------------------------------------------- legend -->
+      <section class="card legend" aria-label="Gestos">
+        <div class="card-head">
+          <h2>Gestos</h2>
+          <span class="muted">segure para confirmar</span>
+        </div>
+        <div class="legend-grid" id="legend-grid"></div>
+        <p class="legend-tip">
+          Aponte o dedo para os lados para usar o direcional. A zona central (círculo
+          tracejado) não dispara nada.
+        </p>
+      </section>
+    </main>
+
+    <!-- ------------------------------------------------------------- modais -->
+    <div class="modal" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" hidden>
+      <div class="modal-card">
+        <header class="modal-head">
+          <h2 id="settings-title">Ajustes</h2>
+          <button class="btn-ico" id="close-settings" type="button" title="Fechar">✕</button>
+        </header>
+
+        <div class="modal-body">
+          <fieldset class="group">
+            <legend>Conexão com o Roku</legend>
+            <label class="field">
+              <span>IP do Roku</span>
+              <input id="input-ip" type="text" inputmode="decimal" placeholder="192.168.0.15" />
+            </label>
+            <div class="row">
+              <button class="btn btn-ghost" id="btn-discover" type="button">Descobrir na rede</button>
+              <button class="btn btn-primary" id="btn-do-connect" type="button">Conectar</button>
+              <button class="btn btn-ghost" id="btn-mock" type="button">Modo simulado</button>
+            </div>
+            <p class="help" id="discover-result">
+              No Roku: Configurações › Sistema › Configurações avançadas › Controle por
+              rede (habilitado).
+            </p>
+          </fieldset>
+
+          <fieldset class="group">
+            <legend>Tempo dos gestos</legend>
+            <label class="field">
+              <span>Tempo para confirmar <b id="hold-value">550 ms</b></span>
+              <input id="input-hold" type="range" min="200" max="1500" step="50" value="550" />
+            </label>
+            <label class="field">
+              <span>Repetição automática <b id="repeat-value">700 ms</b></span>
+              <input id="input-repeat" type="range" min="0" max="2000" step="100" value="700" />
+            </label>
+            <label class="field">
+              <span>Confiança mínima <b id="conf-value">60%</b></span>
+              <input id="input-conf" type="range" min="30" max="90" step="5" value="60" />
+            </label>
+            <label class="check">
+              <input id="input-skeleton" type="checkbox" checked />
+              <span>Mostrar esqueleto da mão</span>
+            </label>
+            <label class="check">
+              <input id="input-mirror" type="checkbox" checked />
+              <span>Espelhar imagem (efeito selfie)</span>
+            </label>
+          </fieldset>
+
+          <fieldset class="group">
+            <legend>Mapeamento de gestos</legend>
+            <div class="map-grid" id="map-grid"></div>
+          </fieldset>
+        </div>
+
+        <footer class="modal-foot">
+          <button class="btn btn-link" id="btn-reset" type="button">Restaurar padrões</button>
+          <button class="btn btn-primary" id="btn-save" type="button">Salvar</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="modal" id="connect-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" hidden>
+      <div class="modal-card narrow">
+        <header class="modal-head">
+          <h2 id="connect-title">Conectar ao Roku</h2>
+          <button class="btn-ico" id="close-connect" type="button" title="Fechar">✕</button>
+        </header>
+        <div class="modal-body">
+          <p class="help">
+            Buscamos o Roku na sua rede local (SSDP) e enviamos comandos pelo ECP na
+            porta 8060. Se não encontrar, o painel segue no modo simulado.
+          </p>
+          <div class="row">
+            <input id="connect-ip" type="text" inputmode="decimal" placeholder="IP manual (opcional)" />
+            <button class="btn btn-primary" id="connect-go" type="button">Conectar</button>
+          </div>
+          <ul class="device-list" id="device-list"></ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="/js/app.js"></script>
+  </body>
+</html>

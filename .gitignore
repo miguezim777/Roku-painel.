@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node (apenas para testes de front)
+node_modules/
+
+# Ambiente
+.env
+.DS_Store

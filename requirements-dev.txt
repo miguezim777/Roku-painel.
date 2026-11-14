@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8,<10
+# TestClient do Starlette (versões novas da stack FastAPI)
+httpx2>=2
