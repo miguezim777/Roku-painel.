@@ -5,6 +5,7 @@ import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
@@ -602,15 +603,25 @@ class TrackerChoice {
     private var missing = 0
     private var lastLookNs = 0L
     private var lastPairNs = 0L
+    private var busy = false
 
-    fun reset() { pair = false; following = false; singles = 0; missing = 0; lastLookNs = 0L; lastPairNs = 0L }
+    fun reset() { pair = false; following = false; singles = 0; missing = 0; lastLookNs = 0L; lastPairNs = 0L; busy = false }
 
     /** True when the frame that starts at [nowNs] goes to the tracker for two hands. */
     fun forTwo(nowNs: Long): Boolean =
-        pair || !following || (singles >= PROBE_FRAMES && nowNs - lastLookNs >= PROBE_NS)
+        pair || !following ||
+            (singles >= PROBE_FRAMES && nowNs - lastLookNs >= (if (busy) BUSY_PROBE_NS else PROBE_NS))
 
-    /** A frame is done at [nowNs]: it went to the tracker for two if [usedTwo], and found [count] hands. */
-    fun result(usedTwo: Boolean, count: Int, nowNs: Long) {
+    /**
+     * A frame is done at [nowNs]: it went to the tracker for two if [usedTwo], and found [count]
+     * hands. [speed] is how fast the one hand followed moves over the picture, in widths of the
+     * picture a second (0 when that is not known).
+     */
+    fun result(usedTwo: Boolean, count: Int, nowNs: Long, speed: Float = 0f) {
+        // A look for the second hand takes as long as several frames of following the first,
+        // and a hand that is moving fast is the one that gets lost in such a gap: the look waits
+        // until the hand slows down, though not for ever.
+        busy = count == 1 && speed > BUSY_SPEED
         following = count > 0
         if (usedTwo) { lastLookNs = nowNs; singles = 0 } else singles++
         if (usedTwo && count >= 2) { pair = true; missing = 0; lastPairNs = nowNs }
@@ -622,6 +633,10 @@ class TrackerChoice {
         const val PROBE_NS = 350_000_000L
         /** and only after this many frames of following the first. */
         const val PROBE_FRAMES = 6
+        /** A hand crossing the picture faster than this, in widths of the picture a second, is busy: */
+        const val BUSY_SPEED = .8f
+        /** the look for the other hand then waits up to this long. */
+        const val BUSY_PROBE_NS = 1_000_000_000L
         /** With two hands followed, one may be missing this long, */
         const val PAIR_HOLD_NS = 400_000_000L
         /** and for at least this many frames, before the cheap tracker takes over. */
@@ -1280,5 +1295,178 @@ class GorillaBody {
         private const val HISTORY_READINGS = 1.25f
         /** The longest it is ever taken over: half a second of steps. */
         private const val HISTORY = 60
+    }
+}
+
+/**
+ * Smooths one angle of a head that is followed without a gyroscope (compass and accelerometer).
+ *
+ * Such readings tremble, so they cannot be shown as they come; but a fixed smoothing that is
+ * strong enough to hide the trembling also makes the picture come a quarter of a second after
+ * the head, every time the head turns. This one smooths as strongly as that only while the head
+ * is still. The faster the head turns, the less it smooths: the trembling is then hidden by the
+ * movement itself, and the picture stays a few degrees behind the head instead of tens.
+ */
+class HeadFilter(private val wraps: Boolean) {
+    private var started = false
+    private var value = 0f
+    private var previous = 0f
+    /** How fast the angle changes, smoothed, in radians a second. */
+    var speed = 0f
+        private set
+
+    fun reset() { started = false; speed = 0f }
+
+    /** The smoothed angle for the reading [raw], which came [dt] seconds after the one before. */
+    fun filter(raw: Float, dt: Float): Float {
+        if (!started || dt <= 0f || dt > MAX_GAP_SECONDS) {
+            started = true; value = raw; previous = raw; speed = 0f
+            return raw
+        }
+        val step = if (wraps) Look.angleDifference(raw, previous) else raw - previous
+        previous = raw
+        speed += (step / dt - speed) * (dt / (SPEED_SECONDS + dt))
+        val seconds = max(FAST_SECONDS, REST_SECONDS / (1f + max(0f, abs(speed) - REST_SPEED) * GAIN))
+        val behind = if (wraps) Look.angleDifference(raw, value) else raw - value
+        value += behind * (dt / (seconds + dt))
+        return value
+    }
+
+    companion object {
+        /** The smoothing while the head is still: the same as the fixed one it replaces. */
+        const val REST_SECONDS = .25f
+        /** The least smoothing, in a fast turn. */
+        const val FAST_SECONDS = .03f
+        /** A change slower than this, in radians a second (20 degrees), counts as trembling. */
+        const val REST_SPEED = .35f
+        /** How quickly the smoothing gives way above that: per radian a second. */
+        const val GAIN = 6f
+        /** The speed itself is smoothed over this long, or trembling would pass for turning. */
+        const val SPEED_SECONDS = .15f
+        const val MAX_GAP_SECONDS = .5f
+    }
+}
+
+/**
+ * What happened since the game was opened, added up frame by frame: for how long hands were on
+ * the screen, how near the ground they came, how far the body went. The line of measurements
+ * tells how one second was; this tells what the player did, and it is short enough to survive
+ * being pasted into a message.
+ */
+class SessionLog {
+    var seconds = 0f
+        private set
+    /** Seconds with at least one hand drawn, and with at least one hand followed. */
+    var seenSeconds = 0f
+        private set
+    var liveSeconds = 0f
+        private set
+    /** Seconds each hand was drawn, and held on to something. */
+    val handSeconds = FloatArray(2)
+    val touchSeconds = FloatArray(2)
+    /** The nearest each hand came to the ground, in metres; [NEVER] when it was never drawn. */
+    val nearest = floatArrayOf(NEVER, NEVER)
+    /** Times a hand that was drawn went away. */
+    var losses = 0
+        private set
+    /** Metres the body went over the ground. */
+    var walked = 0f
+        private set
+    /** Seconds a hand was further off than the arm is long, and was brought back. */
+    var stretchedSeconds = 0f
+        private set
+    var taken = 0
+        private set
+    /** Readings that had a hand in them, and readings that had none. */
+    var readingsWithHand = 0
+        private set
+    var readingsWithout = 0
+        private set
+    var frames = 0
+        private set
+    var slowFrames = 0
+        private set
+    private var blows = 0
+    private var dummiesDown = 0
+    private val was = BooleanArray(2)
+    private val had = BooleanArray(2)
+    private var lastX = 0f
+    private var lastZ = 0f
+    private var placed = false
+
+    /**
+     * One frame of [dt] seconds, after the game was updated. [handsRead] is the number of hands
+     * in the reading that arrived for this frame, or -1 when none arrived; [slow] says the frame
+     * took as long as two.
+     */
+    fun frame(dt: Float, game: Coliseum, handsRead: Int, slow: Boolean) {
+        seconds += dt; frames++
+        if (slow) slowFrames++
+        if (handsRead > 0) readingsWithHand++ else if (handsRead == 0) readingsWithout++
+        var seen = false; var live = false; var stretched = false
+        for (i in 0..1) {
+            val present = game.handPresent[i]
+            if (was[i] && !present) losses++
+            was[i] = present
+            val holds = game.held[i] != null
+            if (holds && !had[i]) taken++
+            had[i] = holds
+            if (!present) continue
+            seen = true
+            if (game.handLive[i]) live = true
+            handSeconds[i] += dt
+            if (game.armUsed[i] > 1f) stretched = true
+            if (game.body.touching[i]) { touchSeconds[i] += dt; nearest[i] = min(nearest[i], 0f) }
+            else {
+                val above = game.palm[i * 3 + 1] - game.world.floorAt(game.palm[i * 3], game.palm[i * 3 + 2]) - game.body.handRadius
+                nearest[i] = min(nearest[i], max(above, 0f))
+            }
+        }
+        if (seen) seenSeconds += dt
+        if (live) liveSeconds += dt
+        if (stretched) stretchedSeconds += dt
+        val x = game.body.x; val z = game.body.z
+        if (placed) {
+            val d = sqrt((x - lastX) * (x - lastX) + (z - lastZ) * (z - lastZ))
+            // Being put back at the gate is not walking.
+            if (d < MAX_STEP) walked += d
+        }
+        lastX = x; lastZ = z; placed = true
+        blows = game.blows; dummiesDown = game.dummiesDown
+    }
+
+    /** The summary, in the language of the player; five short lines. */
+    fun text(): String {
+        val out = StringBuilder()
+        out.append("jogo ").append(time(seconds)).append(" · mãos na tela ").append(share(seenSeconds, seconds))
+            .append(" do tempo (seguidas ").append(share(liveSeconds, seconds)).append(") · sumiram ").append(losses).append(" vezes\n")
+        out.append("leituras com mão ").append(rate(readingsWithHand, liveSeconds)).append(" · buscas sem mão ")
+            .append(rate(readingsWithout, seconds - liveSeconds)).append('\n')
+        out.append("chão:")
+        for (i in 0..1) {
+            out.append(if (i == 0) " E " else " · D ")
+            if (nearest[i] == NEVER) out.append("nunca vista")
+            else out.append("tocou ").append(time(touchSeconds[i])).append(", mais perto ").append((nearest[i] * 100f).roundToInt()).append(" cm")
+        }
+        out.append('\n')
+        out.append("andou ").append((walked * 10f).roundToInt() / 10f).append(" m · braço esticado ").append(share(stretchedSeconds, seenSeconds))
+            .append(" do tempo com mão · armas pegas ").append(taken).append(" · golpes ").append(blows).append(" · bonecos ").append(dummiesDown).append('\n')
+        out.append("tela ").append(if (seconds > 0f) (frames / seconds).roundToInt() else 0).append(" qps em média · ")
+            .append(slowFrames).append(" quadros lentos")
+        return out.toString()
+    }
+
+    private fun time(s: Float): String {
+        val whole = s.roundToInt()
+        return if (whole < 60) "$whole s" else "${whole / 60} min ${whole % 60} s"
+    }
+
+    private fun share(part: Float, all: Float) = if (all > 0f) "${(part * 100f / all).roundToInt()}%" else "–"
+
+    private fun rate(count: Int, s: Float) = if (s >= 1f) "${(count / s).roundToInt()} por segundo" else "–"
+
+    companion object {
+        const val NEVER = 1e9f
+        private const val MAX_STEP = 1f
     }
 }

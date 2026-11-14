@@ -91,6 +91,13 @@ class ColiseumRenderer(
     private var statsStartNs = 0L
     private var statsFrames = 0
     private var statsDrawNs = 0L
+    private val session = SessionLog()
+    // Hands in the reading that arrived for this frame; -1 when none arrived.
+    private var handsRead = -1
+    private var slowFrame = false
+    /** What happened since the game was opened (see [SessionLog]), with what the tracker cost. Renewed once a second. */
+    @Volatile var summary = ""
+        private set
     private var statsResults = 0
 
     fun setTrackerError(message: String) { trackerError = message }
@@ -149,7 +156,8 @@ class ColiseumRenderer(
         val now = System.nanoTime()
         val dt = if (lastFrameNs == 0L) .016f else min((now - lastFrameNs) / 1e9f, .05f)
         // A frame that took as long as two or more: the screen showed the one before again.
-        if (lastFrameNs != 0L && now - lastFrameNs > DROPPED_FRAME_NS) droppedFrames++
+        slowFrame = lastFrameNs != 0L && now - lastFrameNs > DROPPED_FRAME_NS
+        if (slowFrame) droppedFrames++
         lastFrameNs = now
         seconds += dt
         glDisable(GL_SCISSOR_TEST)
@@ -175,6 +183,7 @@ class ColiseumRenderer(
         }
         updateHands(dt, now)
         game.update(dt, look.yaw, look.pitch, roll, inputs)
+        session.frame(dt, game, handsRead, slowFrame)
         if (game.blowStrength > 0f) callbacks.blow(game.blowStrength)
 
         val c = game.camera
@@ -216,8 +225,10 @@ class ColiseumRenderer(
     // ---------------------------------------------------------------- hands
 
     private fun updateHands(dt: Float, now: Long) {
+        handsRead = -1
         if (tracker.frames.read(frame)) {
             statsResults++
+            handsRead = (if (frame.hands[0].present) 1 else 0) + (if (frame.hands[1].present) 1 else 0)
             var turn: FloatArray? = null
             if (steady) {
                 // The reading is stamped when work started on its picture; the picture itself is
@@ -340,9 +351,14 @@ class ColiseumRenderer(
             if (inputs[i].present && game.armUsed[i] > 1f) ground.append(" (braço esticado)")
         }
         callbacks.frameRate(fps)
+        // What one picture costs: with a hand followed (the mean over the session), and when the
+        // whole picture is searched because none is.
+        val followed = if (tracker.trackedFrames > 0) "${tracker.trackedCostMs.roundToInt()} ms por foto com mão" else "nenhuma foto com mão medida"
+        val search = if (tracker.searchCostMs > 0f) "${tracker.searchCostMs.roundToInt()} ms por busca sem mão" else "busca não medida"
+        summary = session.text() + "\nrastreador: $where · $followed · $search"
         callbacks.stats(
-            "$ground · tela $fps qps (${(drawMs * 10f).roundToInt() / 10f} ms) · quedas $droppedFrames · câmera $camera qps · rastreio $results Hz · " +
-                "rede $inference ms · atraso $delay · mãos ${tracker.handsInView} · $where · física ${(1f / GorillaBody.STEP).roundToInt()} Hz $moving · " +
+            "$ground · tela $fps qps (${(drawMs * 10f).roundToInt() / 10f} ms) · quedas $droppedFrames · entrega $camera qps · rastreio $results Hz · " +
+                "rede $inference ms · busca ${tracker.searchCostMs.roundToInt()} ms · atraso $delay · mãos ${tracker.handsInView} · $where · $moving · " +
                 "saltos de mão ${game.body.rejected + rigs[0].rejected + rigs[1].rejected} · mem $memory"
         )
         droppedFrames = 0

@@ -125,6 +125,15 @@ class HandTracker(
     /** Hands followed in the latest frame. */
     @Volatile var handsInView = 0
         private set
+    /** Smoothed cost of one frame in which no hand was followed and none was found: the search, in milliseconds. */
+    @Volatile var searchCostMs = 0f
+        private set
+    /** How light the picture of the camera is, 0 (black) to 1 (white); -1 before the first picture. */
+    @Volatile var brightness = -1f
+        private set
+    private var lonePalmX = 0f
+    private var lonePalmY = 0f
+    private var lonePalmNs = 0L
 
     /** True for the front camera: the view is mirrored like a mirror, so landmarks are too. */
     @Volatile var mirror = false
@@ -238,7 +247,10 @@ class HandTracker(
             var age = (SystemClock.elapsedRealtimeNanos() - frameNs) / 1e6f
             if (age < 0f || age > 500f) age = (startNs - frameNs) / 1e6f
             frameAgeMs = if (age < 0f || age > 500f) -1f else if (frameAgeMs < 0f) age else frameAgeMs + (age - frameAgeMs) * .1f
-            val picture = ByteBufferImageBuilder(frameBuffer(image), width, height, MPImage.IMAGE_FORMAT_RGBA).build()
+            val pixels = frameBuffer(image)
+            val light = lightOf(pixels, width, height)
+            if (light >= 0f) brightness = if (brightness < 0f) light else brightness + (light - brightness) * .2f
+            val picture = ByteBufferImageBuilder(pixels, width, height, MPImage.IMAGE_FORMAT_RGBA).build()
             val inferenceStartNs = System.nanoTime()
             val result = tracker.detectForVideo(picture, processingOptions(rotation), timestampMs)
 
@@ -252,6 +264,7 @@ class HandTracker(
                 }
                 // A frame that also loaded the model says nothing about the running cost.
                 val cost = (nowNs - startNs) / 1e6f
+                if (!tracking && !wasTracking) searchCostMs = if (searchCostMs == 0f) cost else searchCostMs + (cost - searchCostMs) * .15f
                 frameCostMs = if (frameCostMs == 0f) cost else frameCostMs + (cost - frameCostMs) * 0.15f
                 // The rate that matters is the one while a hand is followed, not the idle search.
                 if (tracking && wasTracking && lastResultNs != 0L) {
@@ -316,7 +329,29 @@ class HandTracker(
         choice.reset(); inferenceMs = 0f
         // Whatever was measured belongs to the tracker that is gone.
         trackedFrames = 0; trackedCostMs = 0f; warmUp = 0; gpuFrames = 0
-        frameCostMs = 0f; intervalMs = 0f; lastResultNs = 0L
+        frameCostMs = 0f; intervalMs = 0f; lastResultNs = 0L; searchCostMs = 0f; lonePalmNs = 0L
+    }
+
+    /**
+     * How light the picture is: the mean of a few hundred of its points, 0 to 1. A picture that
+     * is nearly black is one the tracker finds no hand in, whatever else is right.
+     */
+    private fun lightOf(pixels: ByteBuffer, width: Int, height: Int): Float {
+        if (width <= 0 || height <= 0 || pixels.capacity() < width * height * 4) return -1f
+        val stepX = max(1, width / 24); val stepY = max(1, height / 18)
+        var sum = 0; var points = 0
+        var y = stepY / 2
+        while (y < height) {
+            var x = stepX / 2
+            while (x < width) {
+                val at = (y * width + x) * 4
+                sum += (pixels.get(at).toInt() and 255) + (pixels.get(at + 1).toInt() and 255) + (pixels.get(at + 2).toInt() and 255)
+                points += 3
+                x += stepX
+            }
+            y += stepY
+        }
+        return if (points > 0) sum / (points * 255f) else -1f
     }
 
     /** Makes sure a tracker of the requested kind exists. Returns true when one was created now. */
@@ -457,6 +492,16 @@ class HandTracker(
             palmX[n] = x / HandGeometry.PALM.size; palmY[n] = y / HandGeometry.PALM.size
             labelRight[n] = k < labels.size && labels[k].isNotEmpty() && labels[k][0].categoryName() == "Right"
         }
+        // How fast a hand that is followed alone crosses the picture, in widths of it a second.
+        var loneSpeed = 0f
+        if (count == 1) {
+            val seconds = (nowNs - lonePalmNs) / 1e9f
+            if (lonePalmNs != 0L && seconds > 0f && seconds < .5f) {
+                val dx = palmX[0] - lonePalmX; val dy = palmY[0] - lonePalmY
+                loneSpeed = sqrt(dx * dx + dy * dy) / seconds
+            }
+            lonePalmX = palmX[0]; lonePalmY = palmY[0]; lonePalmNs = nowNs
+        } else lonePalmNs = 0L
         slots.assign(count, palmX, palmY, labelRight, arrivalNs, source)
         frame.hands[0].present = false; frame.hands[1].present = false
         for (n in 0 until count) {
@@ -487,7 +532,7 @@ class HandTracker(
         // An empty frame does not make the slots forget which hand was where: changing from one
         // tracker to the other costs an empty frame, and [HandSlots] forgets by itself in time.
         if (count > 0) { lastHandNs = nowNs; tracking = true } else tracking = false
-        if (single != null) choice.result(used === landmarker, count, nowNs)
+        if (single != null) choice.result(used === landmarker, count, nowNs, loneSpeed)
     }
 
     private fun publish(result: HandLandmarkerResult, nowNs: Long, frameNs: Long) {

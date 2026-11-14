@@ -20,6 +20,8 @@ import kotlin.math.sqrt
  * tests look at what the body, the weapons and the pictures do.
  */
 class VrTest {
+    private val DEGREE = 0.017453292f
+
     private val dt = 1f / 60f
 
     // ------------------------------------------------------------ a hand to play with
@@ -1124,5 +1126,115 @@ class VrTest {
         // The hand that is left is lost too: the search is for both again.
         now += 100_000_000L; choice.result(false, 0, now)
         assertTrue(choice.forTwo(now))
+    }
+
+    @Test fun lookForTheSecondHandWaitsWhileTheFirstIsMovingFast() {
+        // 40 ms to follow one hand. Still, the other hand is looked for every 350 ms or so.
+        val still = TrackerChoice()
+        var now = 0L
+        still.result(true, 1, now)
+        var looks = 0
+        while (now < 3_000_000_000L) {
+            val two = still.forTwo(now)
+            now += if (two) 120_000_000L else 40_000_000L
+            if (two) looks++
+            still.result(two, 1, now, .1f)
+        }
+        assertTrue("$looks looks in 3 s", looks in 5..8)
+        // In a stroke (two widths of the picture a second) the look waits for a second: a gap of
+        // 120 ms is when a fast hand gets lost.
+        val busy = TrackerChoice()
+        now = 0L
+        busy.result(true, 1, now)
+        looks = 0
+        var first = 0L
+        while (now < 3_000_000_000L) {
+            val two = busy.forTwo(now)
+            if (two && first == 0L) first = now
+            now += if (two) 120_000_000L else 40_000_000L
+            if (two) looks++
+            busy.result(two, 1, now, 2f)
+        }
+        assertTrue("first look at ${first / 1e9f} s", first >= TrackerChoice.BUSY_PROBE_NS)
+        assertTrue("$looks looks in 3 s", looks in 2..3)
+        // The hand slows down: the look that was put off comes at once.
+        val slowing = TrackerChoice()
+        now = 0L
+        slowing.result(true, 1, now)
+        while (now < 600_000_000L) { assertFalse(slowing.forTwo(now)); now += 40_000_000L; slowing.result(false, 1, now, 2f) }
+        slowing.result(false, 1, now, .1f)
+        assertTrue(slowing.forTwo(now))
+    }
+
+    // ------------------------------------------------------------ a head followed by a compass
+
+    /** The fixed smoothing the filter replaced. */
+    private class Fixed(val seconds: Float) {
+        var value = 0f; var started = false
+        fun filter(raw: Float, dt: Float): Float {
+            if (!started) { started = true; value = raw; return raw }
+            value += Look.angleDifference(raw, value) * (dt / (seconds + dt)); return value
+        }
+    }
+
+    @Test fun viewOfAHeadFollowedByACompassKeepsUpWithATurn() {
+        // 50 readings a second that tremble by 1.5 degrees; the head turns at 90 degrees a second
+        // for a second and a half, passing the place where the angle wraps round.
+        val random = java.util.Random(7)
+        val filter = HeadFilter(true); val fixed = Fixed(HeadFilter.REST_SECONDS)
+        val dt = .02f; val noise = 1.5f * DEGREE
+        var worst = 0f; var worstFixed = 0f
+        var angle = 2.4f
+        for (n in 0 until 75) {
+            angle = Look.angleDifference(angle + 90f * DEGREE * dt, 0f)
+            val raw = Look.angleDifference(angle + random.nextGaussian().toFloat() * noise, 0f)
+            val a = filter.filter(raw, dt); val b = fixed.filter(raw, dt)
+            if (n >= 25) {
+                worst = max(worst, abs(Look.angleDifference(angle, a)))
+                worstFixed = max(worstFixed, abs(Look.angleDifference(angle, b)))
+            }
+        }
+        // The fixed smoothing is a quarter of a second behind: more than 15 degrees here.
+        assertTrue("fixed ${worstFixed / DEGREE} degrees behind", worstFixed > 15f * DEGREE)
+        assertTrue("${worst / DEGREE} degrees behind", worst < 7f * DEGREE)
+        // The head stops: half a second later the view is where the head is.
+        var a = 0f
+        for (n in 0 until 25) a = filter.filter(Look.angleDifference(angle + random.nextGaussian().toFloat() * noise, 0f), dt)
+        assertEquals(0f, Look.angleDifference(angle, a), 2f * DEGREE)
+    }
+
+    @Test fun viewOfAHeadThatIsStillTremblesNoMoreThanItDid() {
+        val random = java.util.Random(11)
+        val filter = HeadFilter(false); val fixed = Fixed(HeadFilter.REST_SECONDS)
+        val dt = .02f; val noise = 1.5f * DEGREE
+        var sum = 0f; var sumFixed = 0f; var steps = 0f; var stepsFixed = 0f
+        var lastA = 0f; var lastB = 0f
+        for (n in 0 until 3000) {
+            val raw = .3f + random.nextGaussian().toFloat() * noise
+            val a = filter.filter(raw, dt); val b = fixed.filter(raw, dt)
+            if (n >= 100) {
+                sum += (a - .3f) * (a - .3f); sumFixed += (b - .3f) * (b - .3f)
+                steps += abs(a - lastA); stepsFixed += abs(b - lastB)
+            }
+            lastA = a; lastB = b
+        }
+        val rms = sqrt(sum / 2900f); val rmsFixed = sqrt(sumFixed / 2900f)
+        // A third of a degree, as with the fixed smoothing, give or take a quarter.
+        assertTrue("${rms / DEGREE} degrees, fixed ${rmsFixed / DEGREE}", rms < rmsFixed * 1.25f && rms < .4f * DEGREE)
+        assertTrue("steps ${steps / 2900f / DEGREE} degrees, fixed ${stepsFixed / 2900f / DEGREE}", steps < stepsFixed * 1.3f)
+    }
+
+    @Test fun slowLookAroundIsNotLeftFarBehindEither() {
+        // 30 degrees a second: the fixed smoothing is 7 degrees behind, this one under 5.
+        val random = java.util.Random(3)
+        val filter = HeadFilter(true)
+        val dt = .02f
+        var worst = 0f; var angle = 0f
+        for (n in 0 until 150) {
+            angle += 30f * DEGREE * dt
+            val a = filter.filter(angle + random.nextGaussian().toFloat() * 1.5f * DEGREE, dt)
+            if (n >= 50) worst = max(worst, abs(angle - a))
+        }
+        assertTrue("${worst / DEGREE} degrees behind", worst < 5.5f * DEGREE)
     }
 }

@@ -15,7 +15,10 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.opengl.GLSurfaceView
 import android.os.BatteryManager
 import android.os.Build
@@ -50,6 +53,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -93,6 +97,30 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     private var cooledDown = false
     private var oneHand = false
     private lateinit var handsButton: Button
+    // What the camera itself does, counted where its pictures are made and not where they arrive.
+    private val captured = AtomicInteger()
+    @Volatile private var exposureNs = 0L
+    private var capturedAtMs = 0L
+    private var cameraRate = -1
+    private var rateAsked = FREE_RATE
+    // Pictures at a steady rate; given up for the session when they come out too dark.
+    private var steadyCamera = true
+    private var darkSeconds = 0
+    private var startedAtMs = 0L
+    // Readings of the sensor that follows the head, counted over each second.
+    private var lookReadings = 0
+    private var lookRate = -1
+    // Without a gyroscope: the smoothing that gives way when the head turns, or the fixed one.
+    private var quickCompass = true
+    private val headYaw = HeadFilter(true)
+    private val headPitch = HeadFilter(false)
+    private val headRoll = HeadFilter(true)
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            captured.incrementAndGet()
+            exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+        }
+    }
     private var ipdMm = 63
     private var lensMm = 42
     private var quarterTurns = 1
@@ -143,6 +171,8 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         lensMm = settings.getInt(KEY_LENS, 42).coerceIn(MIN_LENS_MM, MAX_LENS_MM)
         fluid = settings.getBoolean(KEY_FLUID, false)
         oneHand = settings.getBoolean(KEY_ONE_HAND, false)
+        quickCompass = settings.getBoolean(KEY_QUICK_COMPASS, true)
+        startedAtMs = SystemClock.elapsedRealtime()
         eyeCm = settings.getInt(KEY_EYE_CM, DEFAULT_EYE_CM).coerceIn(MIN_EYE_CM, MAX_EYE_CM)
         reachTenths = settings.getInt(KEY_REACH, DEFAULT_REACH_TENTHS).coerceIn(MIN_REACH_TENTHS, MAX_REACH_TENTHS)
         findLookModes()
@@ -222,6 +252,19 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         button("Escala −") { lensMm = (lensMm - 2).coerceAtLeast(MIN_LENS_MM); saveStereo() }
         button("Escala +") { lensMm = (lensMm + 2).coerceAtMost(MAX_LENS_MM); saveStereo() }
         lookButton = button(lookLabel()) { nextLookMode() }
+        if (compass) {
+            var compassButton: Button? = null
+            compassButton = button(compassLabel()) {
+                quickCompass = !quickCompass
+                settings.edit().putBoolean(KEY_QUICK_COMPASS, quickCompass).apply()
+                headYaw.reset(); headPitch.reset(); headRoll.reset()
+                compassButton?.text = compassLabel()
+                renderer.showNotice(
+                    if (quickCompass) "Bússola rápida: a vista acompanha a cabeça quase sem atraso quando ela gira, e só é alisada quando ela está parada."
+                    else "Bússola suave: a vista é sempre alisada. Treme menos, mas chega um quarto de segundo depois da cabeça."
+                )
+            }
+        }
         modeButton = button(modeLabel()) { fluid = !fluid; saveBody(); renderer.showNotice(modeNotice()) }
         button("Altura −") { eyeCm = (eyeCm - 5).coerceAtLeast(MIN_EYE_CM); saveBody() }
         bodyLabel = button(bodyText()) { eyeCm = DEFAULT_EYE_CM; reachTenths = DEFAULT_REACH_TENTHS; saveBody() }
@@ -262,6 +305,8 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     // ---------------------------------------------------------------- ColiseumRenderer.Callbacks (GL thread)
 
     override fun status(text: String) { runOnUiThread { showStatus(text) } }
+    private fun compassLabel() = if (quickCompass) "Bússola: rápida" else "Bússola: suave"
+
     private fun handsLabel() = if (oneHand) "Mãos: uma (rápido)" else "Mãos: duas"
 
     /**
@@ -296,11 +341,53 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
 
     override fun stats(text: String) {
         runOnUiThread {
-            val line = text + " · desenho ${min(renderWidth, if (viewWidth > 0) viewWidth else renderWidth)} px" + heatText()
+            val nowMs = SystemClock.elapsedRealtime()
+            val pictures = captured.getAndSet(0)
+            val readings = lookReadings
+            lookReadings = 0
+            if (capturedAtMs != 0L && nowMs > capturedAtMs) {
+                cameraRate = (pictures * 1000f / (nowMs - capturedAtMs)).roundToInt()
+                lookRate = (readings * 1000f / (nowMs - capturedAtMs)).roundToInt()
+            }
+            capturedAtMs = nowMs
+            val line = text + " · " + deviceText() + heatText()
             stats.text = line
-            measurements.addLast(line)
+            // Each line says when it was, so that it can be told what came before what.
+            measurements.addLast("${(nowMs - startedAtMs) / 1000L} s · $line")
             while (measurements.size > MAX_MEASUREMENTS) measurements.removeFirst()
+            watchLight()
         }
+    }
+
+    /**
+     * What the camera and the sensors do, measured where it happens: pictures the camera makes a
+     * second (not the ones that reach the tracker, which takes one only when it is free), how
+     * long each one gathers light, how light it comes out, and how often the head is read.
+     */
+    private fun deviceText(): String {
+        val exposure = exposureNs
+        val light = tracker.brightness
+        return "câmera " + (if (cameraRate >= 0) "$cameraRate qps" else "–") + " (pedido $rateAsked)" +
+            (if (exposure > 0L) " · exposição ${(exposure / 1e6f).roundToInt()} ms" else "") +
+            (if (light >= 0f) " · luz ${(light * 100f).roundToInt()}%" else "") +
+            (if (lookMode != LookMode.TOUCH && lookRate >= 0) " · sensor do olhar $lookRate Hz" else "") +
+            " · desenho ${min(renderWidth, if (viewWidth > 0) viewWidth else renderWidth)} px"
+    }
+
+    /**
+     * Pictures at a steady 30 a second cannot gather light for longer than a thirtieth of a
+     * second. Where there is too little light for that they come out nearly black, and then no
+     * hand is found at all, which is worse than a hand that smears: the camera goes back to
+     * taking the time it wants.
+     */
+    private fun watchLight() {
+        val light = tracker.brightness
+        if (!steadyCamera || rateAsked == FREE_RATE || light < 0f || light >= DARK_PICTURE) { darkSeconds = 0; return }
+        if (++darkSeconds < DARK_SECONDS) return
+        darkSeconds = 0
+        steadyCamera = false
+        bindCamera()
+        renderer.showNotice("Pouca luz: a câmera voltou a demorar mais em cada foto, para a imagem não sair escura. A mão em movimento borra nessas fotos; se puder, acenda mais luz.")
     }
 
     /**
@@ -333,8 +420,13 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     private fun copyMeasurements() {
         val text = StringBuilder()
         text.append("Coliseu · ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}\n")
-        text.append("${lookLabel()} · ${modeLabel()} · ${bodyText()} · ${stereoLabel()}\n")
-        for (line in measurements) text.append(line).append('\n')
+        text.append("${lookLabel()}${if (compass && lookMode == LookMode.GYROSCOPE) " (" + compassLabel() + ")" else ""} · ${modeLabel()} · ${bodyText()} · ${stereoLabel()} · ${handsLabel()}\n")
+        // First what happened in the whole session, in a few lines, then the seconds from the
+        // newest back: a message that cuts the text short still has what matters.
+        text.append("RESUMO\n").append(renderer.summary).append('\n')
+        text.append(deviceText()).append(heatText()).append('\n')
+        text.append("SEGUNDO A SEGUNDO (o mais novo primeiro)\n")
+        for (i in measurements.indices.reversed()) text.append(measurements[i]).append('\n')
         try {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("Medições do Coliseu", text.toString()))
@@ -517,21 +609,32 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
                     SensorManager.getRotationMatrixFromVector(rotationMatrix, floatArrayOf(values[0], values[1], values[2]))
                 }
                 Look.headFromRotationMatrix(rotationMatrix, quarterTurns, lookOut)
+                lookReadings++
                 if (compass && sensorLook.ready) {
-                    // The compass trembles: only its slow part is followed.
                     val dt = if (gravityNs == 0L) 0f else (event.timestamp - gravityNs) / 1e9f
-                    val k = if (dt <= 0f || dt > .5f) 1f else dt / (COMPASS_SMOOTHING_SECONDS + dt)
-                    sensorLook.yaw += Look.angleDifference(lookOut[0], sensorLook.yaw) * k
-                    sensorLook.pitch += (lookOut[1] - sensorLook.pitch) * k
-                    sensorLook.roll += Look.angleDifference(lookOut[2], sensorLook.roll) * k
+                    if (quickCompass) {
+                        // The compass trembles, but smoothing it makes the view come after the
+                        // head: it is smoothed while the head is still and less as it turns.
+                        sensorLook.yaw = headYaw.filter(lookOut[0], dt)
+                        sensorLook.pitch = headPitch.filter(lookOut[1], dt)
+                        sensorLook.roll = headRoll.filter(lookOut[2], dt)
+                    } else {
+                        // Only the slow part of the compass is followed.
+                        val k = if (dt <= 0f || dt > .5f) 1f else dt / (COMPASS_SMOOTHING_SECONDS + dt)
+                        sensorLook.yaw += Look.angleDifference(lookOut[0], sensorLook.yaw) * k
+                        sensorLook.pitch += (lookOut[1] - sensorLook.pitch) * k
+                        sensorLook.roll += Look.angleDifference(lookOut[2], sensorLook.roll) * k
+                    }
                 } else {
                     sensorLook.yaw = lookOut[0]; sensorLook.pitch = lookOut[1]; sensorLook.roll = lookOut[2]
+                    headYaw.reset(); headPitch.reset(); headRoll.reset()
                 }
                 gravityNs = event.timestamp
                 sensorLook.ready = true
             }
             Sensor.TYPE_ACCELEROMETER -> {
                 if (lookMode != LookMode.TILT || values.size < 3) return
+                lookReadings++
                 // The reading also contains every shake of the hand: only its slow part is gravity.
                 val dt = if (gravityNs == 0L) 0f else (event.timestamp - gravityNs) / 1e9f
                 gravityNs = event.timestamp
@@ -620,18 +723,23 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
      * is not bright lets each picture take up to a tenth of a second to gather light: fewer
      * pictures, and a moving hand is a smear in each of them, which is when the tracker loses it.
      * With the rate fixed no picture can take longer than a thirtieth of a second; it comes out
-     * darker and grainier instead, which the tracker copes with better.
+     * darker instead, and when it comes out too dark the steady rate is given up ([watchLight]).
+     * Returns the rate asked for, for the line of measurements.
      */
     @SuppressLint("UnsafeOptInUsageError")
-    private fun steadyFrameRate(builder: ImageAnalysis.Builder, front: Boolean) {
+    private fun cameraOptions(builder: ImageAnalysis.Builder, front: Boolean, steady: Boolean): String {
+        var asked = FREE_RATE
         try {
+            // Every picture the camera makes is counted, and how long it gathered light is read.
+            Camera2Interop.Extender(builder).setSessionCaptureCallback(captureCallback)
+            if (!steady) return asked
             val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val facing = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
             for (id in manager.cameraIdList) {
                 val c = manager.getCameraCharacteristics(id)
                 if (c.get(CameraCharacteristics.LENS_FACING) != facing) continue
                 // The first camera on that side is the one CameraX opens.
-                val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
+                val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return asked
                 var best: Range<Int>? = null
                 for (r in ranges) {
                     if (r.upper > 30) continue
@@ -639,13 +747,15 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
                     // The highest floor wins; between equal floors, the higher ceiling.
                     if (b == null || r.lower > b.lower || (r.lower == b.lower && r.upper > b.upper)) best = r
                 }
-                val chosen = best ?: return
+                val chosen = best ?: return asked
                 // Nothing to gain from a range that still allows slow pictures.
-                if (chosen.lower < 20) return
+                if (chosen.lower < 20) return asked
                 Camera2Interop.Extender(builder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosen)
-                return
+                asked = "${chosen.lower}–${chosen.upper}"
+                return asked
             }
         } catch (_: Exception) {}
+        return asked
     }
 
     /** The camera only feeds the hand tracker; its picture is not shown. */
@@ -661,7 +771,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
             @Suppress("DEPRECATION")
             val rotation = windowManager.defaultDisplay.rotation
             val builder = ImageAnalysis.Builder()
-            steadyFrameRate(builder, frontCamera)
+            rateAsked = cameraOptions(builder, frontCamera, steadyCamera)
             val analysis = builder
                 .setTargetRotation(rotation)
                 .setResolutionSelector(
@@ -736,6 +846,13 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         const val KEY_LENS = "lens_mm"
         const val KEY_FLUID = "locomotion_fluid"
         const val KEY_ONE_HAND = "one_hand"
+        const val KEY_QUICK_COMPASS = "quick_compass"
+        /** What the line of measurements says when the camera was left to choose its own rate. */
+        const val FREE_RATE = "livre"
+        /** A picture whose mean is under this, of 1, is too dark to find a hand in, */
+        const val DARK_PICTURE = .12f
+        /** when it stays so for this many seconds. */
+        const val DARK_SECONDS = 4
         /** The picture is never drawn narrower than this by itself, */
         const val MIN_RENDER_WIDTH = 960
         /** and gets this much narrower each time */

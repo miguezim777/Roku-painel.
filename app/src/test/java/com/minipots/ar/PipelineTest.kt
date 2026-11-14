@@ -58,6 +58,7 @@ class PipelineTest {
     var readings = 0
     var lostFrames = 0
     var highest = 0f
+    var log: SessionLog? = null
     var trace = false
 
     private fun now() = 1_000_000_000L + (time.toDouble() * 1e9).toLong()
@@ -81,6 +82,7 @@ class PipelineTest {
     /** One drawn frame, as [ColiseumRenderer] does it. */
     fun frame(phone: Phone, dt: Float = 1f / 60f) {
         time += dt
+        var arrived = -1
         // The camera takes a picture whenever the tracker is free for one.
         while (time >= nextPicture) {
             val f = HandsFrame(); f.aspect = aspect; f.focal = focal; f.timeNs = 1_000_000_000L + (nextPicture.toDouble() * 1e9).toLong()
@@ -105,7 +107,8 @@ class PipelineTest {
         }
         while (waiting.isNotEmpty() && waiting[0].first <= time) {
             val f = waiting.removeAt(0).second
-            for (i in 0..1) if (f.hands[i].present) { rigs[i].accept(f.hands[i], f.timeNs, f.aspect, f.focal); readings++ }
+            arrived = 0
+            for (i in 0..1) if (f.hands[i].present) { rigs[i].accept(f.hands[i], f.timeNs, f.aspect, f.focal); readings++; arrived++ }
         }
         for (i in 0..1) {
             val rig = rigs[i]
@@ -125,6 +128,7 @@ class PipelineTest {
             }
         }
         game.update(dt, 0f, pitch, 0f, inputs)
+        log?.frame(dt, game, arrived, false)
         highest = max(highest, game.body.y)
         if (trace) {
             val r = real[1]; val c = cos(pitch); val sn = sin(pitch)
@@ -293,5 +297,30 @@ class PipelineTest {
             val went = p.walk(phone, 5, into = into)
             println("into $into small $small rate $rate lostBeyond $lost: went $went m; rejected body ${p.game.body.rejected} rigs ${p.rigs[0].rejected + p.rigs[1].rejected}; readings ${p.readings}; lost frames ${p.lostFrames}; highest ${p.highest}")
         }
+    }
+
+    @Test fun summaryOfTheSessionTellsWhatThePlayerDid() {
+        val p = PipelineTest()
+        val log = SessionLog()
+        p.log = log
+        val went = p.walk(Phone(15f), 5, into = .1f)
+        // Both hands were on the screen nearly all the time, touched the sand, and the body went
+        // about as far as the walk says (it also rises and comes down, which is not counted).
+        assertTrue(log.seenSeconds > log.seconds * .8f)
+        assertTrue(log.touchSeconds[0] > .5f && log.touchSeconds[1] > .5f)
+        assertEquals(0f, log.nearest[0], 1e-6f)
+        assertTrue("walked ${log.walked}, went $went", log.walked >= went - .01f && log.walked < went * 1.5f + .5f)
+        assertEquals(0, log.taken)
+        assertTrue(log.readingsWithHand > 50)
+        val text = log.text()
+        assertEquals(5, text.split('\n').size)
+        assertTrue(text, text.contains("E tocou") && text.contains("mais perto 0 cm") && text.contains("andou"))
+        // A session in which no hand was ever seen says so, instead of giving numbers.
+        val empty = SessionLog()
+        val q = PipelineTest()
+        q.log = empty
+        repeat(120) { q.frame(Phone(10f)) }
+        assertTrue(empty.text(), empty.text().contains("E nunca vista · D nunca vista"))
+        assertTrue(empty.text(), empty.text().contains("mãos na tela 0%"))
     }
 }
