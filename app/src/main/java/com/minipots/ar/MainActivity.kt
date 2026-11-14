@@ -18,6 +18,7 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -47,6 +48,10 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
     private var surfaceResumed = false
     private var viewWidth = 0
     private var viewHeight = 0
+    private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) startCamera()
+        else showStatus("A câmera é necessária para ver a sua mão. Autorize-a nas configurações do aparelho.")
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -131,7 +136,7 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
 
         showStatus("Preparando a câmera…")
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
-        else requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_REQUEST)
+        else cameraPermission.launch(Manifest.permission.CAMERA)
     }
 
     // ---------------------------------------------------------------- RoomRenderer.Callbacks (GL thread)
@@ -143,13 +148,6 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
     private fun showStatus(message: String) { if (lastStatus != message) { lastStatus = message; status.text = message } }
 
     // ---------------------------------------------------------------- camera
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, results: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, results)
-        if (requestCode != CAMERA_REQUEST) return
-        if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) startCamera()
-        else showStatus("A câmera é necessária para ver a sua mão. Autorize-a nas configurações do aparelho.")
-    }
 
     private fun startCamera() {
         val future = ProcessCameraProvider.getInstance(this)
@@ -249,7 +247,6 @@ class MainActivity : ComponentActivity(), RoomRenderer.Callbacks {
     }
 
     private companion object {
-        const val CAMERA_REQUEST = 10
         const val MAX_RENDER_WIDTH = 720
     }
 }

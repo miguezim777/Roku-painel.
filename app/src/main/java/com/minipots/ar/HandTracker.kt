@@ -65,7 +65,10 @@ class HandState {
  *  - Rendering never waits for tracking. This runs on its own thread and only publishes results.
  *  - Tracking always works on the newest camera frame. Inference is synchronous on this thread and
  *    CameraX keeps only the latest frame meanwhile, so frames are never queued and results never
- *    describe an old image. No frame skipping, no resolution switching, no prediction.
+ *    describe an old image. While a hand is tracked every frame is used: no frame skipping, no
+ *    resolution switching, no prediction.
+ *  - With no hand in view the search for one runs at a reduced rate, so an idle phone stays cool
+ *    and keeps its full speed for when the hand comes back.
  *  - Nothing is allocated per frame except the small result objects MediaPipe returns.
  */
 class HandTracker(context: Context, private val onError: (String) -> Unit) : ImageAnalysis.Analyzer {
@@ -102,7 +105,10 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
     private var tracking = false
     private var lastTimestampMs = 0L
     private var lastSampleNs = 0L
+    private var lastFrameNs = 0L
     private var lastResultNs = 0L
+    private var lastRunNs = 0L
+    private var lastHandNs = 0L
 
     override fun analyze(image: ImageProxy) {
         var returned = false
@@ -115,7 +121,10 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
                 try { Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT + 2 * Process.THREAD_PRIORITY_LESS_FAVORABLE) } catch (_: Exception) {}
             }
             val startNs = System.nanoTime()
+            if (!tracking && startNs - lastHandNs > IDLE_AFTER_NS && startNs - lastRunNs < IDLE_INTERVAL_NS) return
+            lastRunNs = startNs
             val frame = prepareInput(image)
+            val frameNs = image.imageInfo.timestamp
             // The pixels are copied: give the buffer back to the camera before the slow part.
             image.close(); returned = true
             val firstFrame = landmarker == null
@@ -124,12 +133,14 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
             lastTimestampMs = timestampMs
             val result = tracker.detectForVideo(BitmapImageBuilder(frame).build(), timestampMs)
             val nowNs = System.nanoTime()
-            publish(result, nowNs)
+            val wasTracking = tracking
+            publish(result, nowNs, frameNs)
             if (!firstFrame) {
                 // The first frame also loads the model; it says nothing about the running cost.
                 val cost = (nowNs - startNs) / 1e6f
                 frameCostMs = if (frameCostMs == 0f) cost else frameCostMs + (cost - frameCostMs) * 0.15f
-                if (lastResultNs != 0L) {
+                // The rate that matters is the one while a hand is followed, not the idle search.
+                if (tracking && wasTracking && lastResultNs != 0L) {
                     val gap = (nowNs - lastResultNs) / 1e6f
                     intervalMs = if (intervalMs == 0f) gap else intervalMs + (gap - intervalMs) * 0.15f
                 }
@@ -223,12 +234,11 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
         return dst
     }
 
-    private fun publish(result: HandLandmarkerResult, nowNs: Long) {
+    private fun publish(result: HandLandmarkerResult, nowNs: Long, frameNs: Long) {
         val hands = result.landmarks()
         val worlds = result.worldLandmarks()
         if (hands.isEmpty() || hands[0].size < HAND_POINTS) {
             if (tracking) { tracking = false; pinch.reset(); for (f in filters) f.reset() }
-            lastSampleNs = nowNs
             state.publish(null, false, nowNs)
             return
         }
@@ -237,8 +247,14 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
             val p = hand[i]; val x = p.x(); val y = p.y()
             raw[i * 2] = mapping.viewX(x, y); raw[i * 2 + 1] = mapping.viewY(x, y)
         }
-        val dt = if (tracking) (nowNs - lastSampleNs) / 1e9f else 0f
-        lastSampleNs = nowNs; tracking = true
+        // Time between the two camera exposures, which is what the motion happened in. The time at
+        // which results come out also contains the varying cost of inference.
+        var dt = 0f
+        if (tracking) {
+            dt = (frameNs - lastFrameNs) / 1e9f
+            if (dt <= 0f || dt > 0.5f) dt = (nowNs - lastSampleNs) / 1e9f
+        }
+        lastFrameNs = frameNs; lastSampleNs = nowNs; lastHandNs = nowNs; tracking = true
 
         // Speeds are measured in hand sizes per second, so the filter behaves the same whether the
         // hand is near or far.
@@ -272,6 +288,9 @@ class HandTracker(context: Context, private val onError: (String) -> Unit) : Ima
     private companion object {
         const val MODEL_ASSET = "hand_landmarker.task"
         const val MAX_CONSECUTIVE_ERRORS = 5
+        /** After this long without a hand, look for one only every [IDLE_INTERVAL_NS]. */
+        const val IDLE_AFTER_NS = 1_500_000_000L
+        const val IDLE_INTERVAL_NS = 60_000_000L
         /** Share of the visible area kept around it so a hand leaving the screen keeps tracking. */
         const val OFFSCREEN_MARGIN = 0.15f
         /** The tracker crops the hand to 224 px itself; more input than this adds cost, not accuracy. */

@@ -29,7 +29,7 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
 }
 
-// MediaPipe hand landmark model (palm detector + 21-point landmark network, about 7.5 MB).
+// MediaPipe hand landmark model (palm detector + 21-point landmark network, about 7.8 MB).
 // It is downloaded once at build time, checked against the published checksum, and kept out of Git.
 val handModelUrl = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 val handModelSha256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
