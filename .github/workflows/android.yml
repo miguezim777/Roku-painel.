@@ -40,7 +40,8 @@ jobs:
       - name: Summary
         shell: bash
         run: |
-          tests=$(grep -ho '<testsuite [^>]*' app/build/test-results/testDebugUnitTest/*.xml | sed -E 's/.*tests="([0-9]+)".*failures="([0-9]+)".*errors="([0-9]+)".*/\1 tests, \2 failures, \3 errors/')
+          # One report per test class: add them up.
+          tests=$(grep -ho '<testsuite [^>]*' app/build/test-results/testDebugUnitTest/*.xml | sed -E 's/.*tests="([0-9]+)".*failures="([0-9]+)".*errors="([0-9]+)".*/\1 \2 \3/' | awk '{ t += $1; f += $2; e += $3 } END { printf "%d tests, %d failures, %d errors", t, f, e }')
           size=$(stat -c %s app/build/outputs/apk/debug/app-debug.apk)
           echo "::notice title=Result::Unit tests: ${tests}. APK: $((size / 1048576)) MB."
       # Shows the reason for a failure on the run page itself, without opening the full log.
