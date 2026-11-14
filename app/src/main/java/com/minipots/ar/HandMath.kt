@@ -9,6 +9,9 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 
+/** Landmarks of a hand as the tracker reports them. */
+const val HAND_POINTS = 21
+
 // Pure Kotlin maths with no Android dependencies, so it is covered by JVM unit tests.
 // Everything here works on preallocated arrays: nothing allocates per frame.
 

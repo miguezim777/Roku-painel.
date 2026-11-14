@@ -18,8 +18,6 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-const val HAND_POINTS = 21
-
 /** One reading of the hand, copied between the tracking thread and the render thread. */
 class HandSample {
     /** x, y pairs in normalized view coordinates (0..1, y down). May lie slightly outside 0..1. */
@@ -80,8 +78,20 @@ class HandState {
  *  - With no hand in view the search for one runs at a reduced rate, so an idle phone stays cool
  *    and keeps its full speed for when the hand comes back.
  *  - Nothing is allocated per frame except small wrapper and result objects.
+ *
+ * With [hands] = 2 both hands are followed and published to [frames], each in its own slot. Looking
+ * for a second hand is the expensive part of tracking (it runs the palm detector on the whole
+ * picture), and MediaPipe does it on every frame for as long as fewer hands are followed than it
+ * was asked for. So on the CPU two trackers are kept: one that follows a single hand, which is
+ * used while one hand is in view, and one for two hands, which is used while two are in view and
+ * otherwise only a few times a second, to see whether the other hand has come back.
  */
-class HandTracker(context: Context, private val listener: Listener) : ImageAnalysis.Analyzer {
+class HandTracker(
+    context: Context,
+    private val listener: Listener,
+    private val hands: Int = 1,
+    private val modelAsset: String = MODEL_ASSET,
+) : ImageAnalysis.Analyzer {
     /** Called on the tracking thread. */
     interface Listener {
         /** Tracking cannot work at all. */
@@ -93,6 +103,27 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
     }
 
     val state = HandState()
+    /** Both hands, when the tracker was made for two. */
+    val frames = HandsExchange()
+    /** True once the lighter model is the one in use. */
+    @Volatile var lightModel = false
+        private set
+    private var chosenModel: String? = null
+
+    /** Focal length of the camera in units of the width of its buffer (the long side). */
+    @Volatile var focal = DEFAULT_FOCAL
+    /** Smoothed time between two camera frames that reached the tracker, in milliseconds. */
+    @Volatile var captureIntervalMs = 0f
+        private set
+    /** Smoothed age of a camera frame when tracking starts on it, in milliseconds; -1 when the camera's clock is unknown. */
+    @Volatile var frameAgeMs = -1f
+        private set
+    /** Smoothed time the networks take for one frame while a hand is followed, in milliseconds. */
+    @Volatile var inferenceMs = 0f
+        private set
+    /** Hands followed in the latest frame. */
+    @Volatile var handsInView = 0
+        private set
 
     /** True for the front camera: the view is mirrored like a mirror, so landmarks are too. */
     @Volatile var mirror = false
@@ -116,6 +147,18 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
 
     private val appContext = context.applicationContext
     private var landmarker: HandLandmarker? = null
+    /** Follows one hand only; see the class comment. Null on the GPU and when one hand is all that is wanted. */
+    private var single: HandLandmarker? = null
+    private var pairMode = false
+    private var lastPairNs = 0L
+    private var lastProbeNs = 0L
+    private var lastArrivalNs = 0L
+    private val slots = HandSlots()
+    private val frame = HandsFrame()
+    private val slotOf = IntArray(2)
+    private val palmX = FloatArray(2)
+    private val palmY = FloatArray(2)
+    private val labelRight = BooleanArray(2)
     private var failed = false
     private var closed = false
     private var errors = 0
@@ -167,10 +210,15 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
             if (failed || closed) return
             raisePriority()
             val startNs = System.nanoTime()
+            if (lastArrivalNs != 0L) {
+                val gap = (startNs - lastArrivalNs) / 1e6f
+                if (gap < 1000f) captureIntervalMs = if (captureIntervalMs == 0f) gap else captureIntervalMs + (gap - captureIntervalMs) * .1f
+            }
+            lastArrivalNs = startNs
             if (!tracking && startNs - lastHandNs > IDLE_AFTER_NS && startNs - lastRunNs < IDLE_INTERVAL_NS) return
             lastRunNs = startNs
             val created = ensureLandmarker()
-            val tracker = landmarker ?: return
+            val tracker = chooseLandmarker(startNs) ?: return
 
             val width = image.width; val height = image.height
             val rotation = image.imageInfo.rotationDegrees
@@ -180,13 +228,23 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
             val frameNs = image.imageInfo.timestamp
             val timestampMs = max(lastTimestampMs + 1, SystemClock.uptimeMillis())
             lastTimestampMs = timestampMs
-            val frame = ByteBufferImageBuilder(frameBuffer(image), width, height, MPImage.IMAGE_FORMAT_RGBA).build()
-            val result = tracker.detectForVideo(frame, processingOptions(rotation), timestampMs)
+            // How old the picture is when work starts on it. Cameras stamp their frames on one of
+            // two clocks; the one that gives a plausible age is the one in use.
+            var age = (SystemClock.elapsedRealtimeNanos() - frameNs) / 1e6f
+            if (age < 0f || age > 500f) age = (startNs - frameNs) / 1e6f
+            frameAgeMs = if (age < 0f || age > 500f) -1f else if (frameAgeMs < 0f) age else frameAgeMs + (age - frameAgeMs) * .1f
+            val picture = ByteBufferImageBuilder(frameBuffer(image), width, height, MPImage.IMAGE_FORMAT_RGBA).build()
+            val inferenceStartNs = System.nanoTime()
+            val result = tracker.detectForVideo(picture, processingOptions(rotation), timestampMs)
 
             val nowNs = System.nanoTime()
             val wasTracking = tracking
-            publish(result, nowNs, frameNs)
+            if (hands >= 2) publishBoth(result, startNs, nowNs, tracker, width, height, rotation) else publish(result, nowNs, frameNs)
             if (!created) {
+                if (tracking && wasTracking) {
+                    val spent = (nowNs - inferenceStartNs) / 1e6f
+                    inferenceMs = if (inferenceMs == 0f) spent else inferenceMs + (spent - inferenceMs) * .15f
+                }
                 // A frame that also loaded the model says nothing about the running cost.
                 val cost = (nowNs - startNs) / 1e6f
                 frameCostMs = if (frameCostMs == 0f) cost else frameCostMs + (cost - frameCostMs) * 0.15f
@@ -208,6 +266,7 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
         } catch (e: Throwable) {
             loseHand()
             state.publish(null, false, System.nanoTime())
+            if (hands >= 2) { frame.hands[0].present = false; frame.hands[1].present = false; frame.timeNs = System.nanoTime(); frames.publish(frame); handsInView = 0 }
             if (usingGpu && landmarker != null) {
                 // The GPU path is optional: give it one more frame, then go back to the CPU.
                 if (++errors >= 2) {
@@ -247,7 +306,9 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
 
     private fun closeLandmarker() {
         try { landmarker?.close() } catch (_: Exception) {}
-        landmarker = null; usingGpu = false
+        try { single?.close() } catch (_: Exception) {}
+        landmarker = null; single = null; usingGpu = false
+        pairMode = false; inferenceMs = 0f
         // Whatever was measured belongs to the tracker that is gone.
         trackedFrames = 0; trackedCostMs = 0f; warmUp = 0; gpuFrames = 0
         frameCostMs = 0f; intervalMs = 0f; lastResultNs = 0L
@@ -261,26 +322,50 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
         loseHand()
         if (gpu) {
             try {
-                landmarker = createLandmarker(Delegate.GPU); usingGpu = true
+                landmarker = createLandmarker(Delegate.GPU, hands); usingGpu = true
             } catch (e: Throwable) {
                 preferGpu = false
                 listener.gpuFailed()
             }
         }
-        if (landmarker == null) landmarker = createLandmarker(Delegate.CPU)
+        if (landmarker == null) {
+            landmarker = createLandmarker(Delegate.CPU, hands)
+            if (hands >= 2) single = createLandmarker(Delegate.CPU, 1)
+        }
         return true
     }
 
-    private fun createLandmarker(delegate: Delegate): HandLandmarker {
+    /**
+     * The tracker for this frame: the one for a single hand while one hand or none is in view,
+     * with a look for the second hand every [PROBE_NS]; the one for two hands while both are.
+     */
+    private fun chooseLandmarker(nowNs: Long): HandLandmarker? {
+        val one = single ?: return landmarker
+        if (pairMode) return landmarker
+        if (tracking && nowNs - lastProbeNs >= PROBE_NS) { lastProbeNs = nowNs; return landmarker }
+        return one
+    }
+
+    /** The model asked for, or the full one when the APK was built without the lighter one. */
+    private fun modelInUse(): String {
+        chosenModel?.let { return it }
+        val found = modelAsset == MODEL_ASSET || try { appContext.assets.list("")?.contains(modelAsset) == true } catch (_: Exception) { false }
+        val model = if (found) modelAsset else MODEL_ASSET
+        chosenModel = model
+        lightModel = model == LIGHT_MODEL_ASSET
+        return model
+    }
+
+    private fun createLandmarker(delegate: Delegate, count: Int): HandLandmarker {
         val options = HandLandmarker.HandLandmarkerOptions.builder()
             // Starts on the CPU, where tracking cannot take frame rate from drawing. The GPU is
             // used only after it was measured to be better on this phone (ProcessorChooser), or
             // when the user asks for it.
-            .setBaseOptions(BaseOptions.builder().setModelAssetPath(MODEL_ASSET).setDelegate(delegate).build())
+            .setBaseOptions(BaseOptions.builder().setModelAssetPath(modelInUse()).setDelegate(delegate).build())
             // VIDEO mode keeps MediaPipe's own tracking between frames (palm detection only runs
             // when the hand is lost) and returns the result synchronously.
             .setRunningMode(RunningMode.VIDEO)
-            .setNumHands(1)
+            .setNumHands(count)
             .setMinHandDetectionConfidence(0.5f)
             .setMinHandPresenceConfidence(0.5f)
             .setMinTrackingConfidence(0.5f)
@@ -332,6 +417,75 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
         for (f in filters) f.reset()
         for (f in shapeFilters) f.reset()
         depthFilter.reset()
+    }
+
+    /**
+     * Both hands for [frames]: each in its slot, in the upright camera picture and along the
+     * camera axes. Nothing is smoothed here; [HandRig] does that where the hand is drawn.
+     */
+    private fun publishBoth(
+        result: HandLandmarkerResult, arrivalNs: Long, nowNs: Long, used: HandLandmarker, width: Int, height: Int, rotation: Int,
+    ) {
+        val found = result.landmarks()
+        val worlds = result.worldLandmarks()
+        val labels = result.handedness()
+        var count = 0
+        val source = slotOf // reused below; first holds which result each usable hand is
+        val index0: Int; val index1: Int
+        var first = -1; var second = -1
+        for (k in found.indices) {
+            if (found[k].size < HAND_POINTS || k >= worlds.size || worlds[k].size < HAND_POINTS) continue
+            if (count == 0) first = k else if (count == 1) second = k
+            if (++count == 2) break
+        }
+        index0 = first; index1 = second
+        val mirrored = mirror
+        for (n in 0 until count) {
+            val k = if (n == 0) index0 else index1
+            var x = 0f; var y = 0f
+            for (i in HandGeometry.PALM) {
+                val p = found[k][i]
+                var a = FrameMapping.uprightA(rotation, p.x(), p.y())
+                if (mirrored) a = 1f - a
+                x += a; y += FrameMapping.uprightB(rotation, p.x(), p.y())
+            }
+            palmX[n] = x / HandGeometry.PALM.size; palmY[n] = y / HandGeometry.PALM.size
+            labelRight[n] = k < labels.size && labels[k].isNotEmpty() && labels[k][0].categoryName() == "Right"
+        }
+        slots.assign(count, palmX, palmY, labelRight, arrivalNs, source)
+        frame.hands[0].present = false; frame.hands[1].present = false
+        for (n in 0 until count) {
+            val k = if (n == 0) index0 else index1
+            val out = frame.hands[source[n]]
+            out.present = true
+            // The label is right for a palm that faces the way this cross product points; a
+            // mirrored picture turns a right hand into a left one.
+            out.palmSign = if (labelRight[n] != mirrored) 1f else -1f
+            for (i in 0 until HAND_POINTS) {
+                val p = found[k][i]
+                var a = FrameMapping.uprightA(rotation, p.x(), p.y())
+                if (mirrored) a = 1f - a
+                out.image[i * 2] = a; out.image[i * 2 + 1] = FrameMapping.uprightB(rotation, p.x(), p.y())
+                val w = worlds[k][i]
+                HandShape.toCameraSpace(rotation, mirrored, w.x(), w.y(), w.z(), out.world, i * 3)
+            }
+        }
+        // The upright picture is as wide as the buffer is, or as high when it is turned.
+        val uprightWidth = if (rotation == 90 || rotation == 270) height else width
+        val uprightHeight = if (rotation == 90 || rotation == 270) width else height
+        frame.aspect = uprightWidth.toFloat() / uprightHeight
+        frame.focal = focal * width / uprightWidth
+        frame.timeNs = arrivalNs
+        frames.publish(frame)
+        handsInView = count
+
+        if (count > 0) { lastHandNs = nowNs; tracking = true } else { tracking = false; slots.reset() }
+        // Two hands in view: stay with the tracker for two. One of them gone for a while: back to
+        // the cheap one.
+        if (single != null) {
+            if (count >= 2 && used === landmarker) { pairMode = true; lastPairNs = nowNs }
+            else if (pairMode && nowNs - lastPairNs > PAIR_HOLD_NS) { pairMode = false; lastProbeNs = nowNs }
+        }
     }
 
     private fun publish(result: HandLandmarkerResult, nowNs: Long, frameNs: Long) {
@@ -406,29 +560,37 @@ class HandTracker(context: Context, private val listener: Listener) : ImageAnaly
 
     private fun distance(x: Float, y: Float, z: Float) = sqrt(x * x + y * y + z * z)
 
-    private companion object {
-        const val MODEL_ASSET = "hand_landmarker.task"
-        const val MAX_CONSECUTIVE_ERRORS = 5
-        const val WARM_UP_FRAMES = 5
-        const val MEAN_WINDOW = 200
-        const val GPU_READY_FRAMES = 3
+    companion object {
+        /** The lighter model: the same palm detector with the small landmark network. */
+        const val LIGHT_MODEL_ASSET = "hand_landmarker_lite.task"
+        /** Focal length of a typical phone camera in units of the long side of its picture. */
+        const val DEFAULT_FOCAL = .77f
+        private const val MODEL_ASSET = "hand_landmarker.task"
+        /** While one hand is followed, the other one is looked for this often. */
+        private const val PROBE_NS = 350_000_000L
+        /** With two hands followed, one may be missing this long before the cheap tracker takes over. */
+        private const val PAIR_HOLD_NS = 400_000_000L
+        private const val MAX_CONSECUTIVE_ERRORS = 5
+        private const val WARM_UP_FRAMES = 5
+        private const val MEAN_WINDOW = 200
+        private const val GPU_READY_FRAMES = 3
         /** After this long without a hand, look for one only every [IDLE_INTERVAL_NS]. */
-        const val IDLE_AFTER_NS = 1_500_000_000L
-        const val IDLE_INTERVAL_NS = 60_000_000L
+        private const val IDLE_AFTER_NS = 1_500_000_000L
+        private const val IDLE_INTERVAL_NS = 60_000_000L
         // One Euro filter, with speed in hand sizes per second. Chosen by simulation at 15 and 30
         // results per second: a still hand keeps 40% of its jitter, and a hand that starts moving
         // is followed within about 2% of its own size, at any speed.
         /** The 3D shape is in metres; the filter wants hand sizes (about 9 cm) per second. */
-        const val SHAPE_SPEED_SCALE = 11f
-        const val DEPTH_SPEED_SCALE = 5f
+        private const val SHAPE_SPEED_SCALE = 11f
+        private const val DEPTH_SPEED_SCALE = 5f
         /** Focal length of a phone camera in units of the long side of its picture. */
-        const val FOCAL_LENGTH = .77f
-        const val MIN_DEPTH = .15f
-        const val MAX_DEPTH = 1.0f
+        private const val FOCAL_LENGTH = .77f
+        private const val MIN_DEPTH = .15f
+        private const val MAX_DEPTH = 1.0f
         /** Pairs of landmarks across the palm, whose distances give the size of the hand. */
-        val DEPTH_PAIRS = intArrayOf(0, 9, 5, 17, 0, 5, 0, 17)
-        const val MIN_CUTOFF_HZ = 1.2f
-        const val BETA = 20f
-        const val DERIVATIVE_CUTOFF_HZ = 2f
+        private val DEPTH_PAIRS = intArrayOf(0, 9, 5, 17, 0, 5, 0, 17)
+        private const val MIN_CUTOFF_HZ = 1.2f
+        private const val BETA = 20f
+        private const val DERIVATIVE_CUTOFF_HZ = 2f
     }
 }

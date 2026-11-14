@@ -26,24 +26,44 @@ O botão **CPU ⇄ GPU** troca na mão, encerra a medição automática e també
 
 Se o custo por quadro é baixo e mesmo assim `mão N Hz` fica em 22 ou menos, quem limita é a câmera (ela reduz as imagens por segundo com pouca luz). O app avisa quando percebe isso: mais luz resolve, trocar de processador não.
 
-## Coliseu
+## Coliseu (para óculos VR Box)
 
-O botão **Coliseu** (última fileira do Mini Pots) abre um segundo jogo; o botão **Potinhos** volta. Nele a imagem da câmera não aparece: a tela mostra só a arena, e a câmera serve para seguir **uma mão**, desenhada em 3D na cor da pele na ponta de um braço comprido.
+O botão **Coliseu** (última fileira do Mini Pots) abre um segundo jogo; o botão **Potinhos** volta. Ele foi feito para o celular dentro de um óculos do tipo VR Box: a tela fica deitada e mostra a arena **duas vezes, uma para cada olho**. A imagem da câmera não aparece; a câmera traseira serve para seguir **as duas mãos**, e os sensores de movimento seguem a cabeça.
 
-![Arena do Coliseu com a espada na mão](docs/coliseu.png)
+![As duas imagens do Coliseu, com as duas mãos](docs/coliseu.png)
 
-*Imagem gerada no computador pelo código de desenho do próprio jogo, com uma mão de teste. Não é captura de tela de um celular.*
+*Imagem gerada no computador pelo código de desenho do próprio jogo, com mãos lidas de fotografias pelo MediaPipe. Não é captura de tela de um celular.*
 
-- **Andar (como no Gorilla Tag):** não há pernas nem botão de andar. Olhe para o chão, encoste a mão nele (aparece um círculo claro embaixo da mão) e puxe: o corpo vai para o lado contrário ao da mão. Puxar para trás anda para frente, empurrar para baixo levanta o corpo, e um empurrão rápido vira pulo ou deslize. A sombra da mão mostra a que altura ela está.
-- **Pegar:** feche a mão sobre a espada, o machado ou a maça fincados na areia. A arma fica na mão, ao longo dos nós dos dedos, até você mostrar a mão aberta por um instante. Se a câmera perder a mão no meio de um golpe, a arma não cai.
-- **Bater:** balance a arma através de um boneco de palha. Só conta golpe rápido; encostar devagar não faz nada. Três golpes (ou menos, se forem fortes) desmontam o boneco, que volta depois de 4 segundos. O celular vibra de leve a cada golpe, se a vibração de toque estiver ligada no sistema.
+**Antes de pôr o celular no óculos** (toque na tela esconde e mostra os botões):
+
+- **VR: ligado/desligado** troca entre as duas imagens e uma imagem só (para jogar com o celular na mão).
+- **DIP − / DIP +** ajusta a distância entre os olhos (52 a 74 mm; o comum é 63). O botão do meio mostra os valores e, tocado, volta ao padrão.
+- **Escala − / Escala +** ajusta a distância da lente à tela (28 a 70 mm), que é o que decide o tamanho com que o mundo aparece. Se tudo parecer grande demais, aumente; pequeno demais, diminua.
+- **Olhar** escolhe como a cabeça é seguida (abaixo). **Recentrar** faz da direção atual a "frente".
+
+**Com o óculos no rosto**, as teclas de volume fazem o que os dedos não alcançam: **volume +** recentra a vista, **volume −** mostra ou esconde os botões.
+
+- **Mãos:** cada mão real aparece como uma mão 3D na cor da pele, com palma, dedos de três ossos, unhas e um punho curto, sem braço. Ela fica onde a mão real está na frente da câmera, à esquerda ou à direita, perto ou longe. Uma mão que a câmera perde continua no lugar por um instante, ficando cinza, e depois some; no lugar dela aparece um ponto âmbar embaixo, do lado da mão que falta. A mão nunca é desenhada onde ela não foi vista.
+- **Andar (como no Gorilla Tag):** não há pernas nem botão de andar. Olhe para o chão, encoste uma mão nele (aparece um círculo claro embaixo da mão) e puxe: o corpo vai para o lado contrário ao da mão. Puxar para trás anda para frente, empurrar para baixo levanta o corpo, e um empurrão rápido vira pulo ou deslize. As duas mãos valem, juntas ou alternadas, e também dá para se apoiar no muro e nos bonecos. A sombra de cada mão mostra a que altura ela está.
+- **Pegar:** feche a mão sobre o cabo da espada, do machado ou da maça fincados na areia. A arma fica na mão até você mostrar a mão aberta por um instante; se a mão estiver em movimento ao abrir, a arma é **arremessada**. Dá para segurar uma arma em cada mão. Se a câmera perder a mão no meio de um golpe, a arma não cai.
+- **Bater:** balance a arma através de um boneco de palha. Só conta golpe rápido; encostar devagar não faz nada. Três golpes (ou menos, se forem fortes) desmontam o boneco, que volta depois de 4 segundos. Arma arremessada também acerta.
 - **Olhar em volta** — o botão **Olhar** alterna entre os modos que o aparelho permite, e a escolha fica guardada:
-  - **giroscópio:** a vista acompanha o celular; arrastar o dedo na tela também vira, para não precisar girar o corpo;
-  - **inclinar + dedo** (para quem **não tem giroscópio**): o acelerômetro diz o quanto o celular está inclinado para cima ou para baixo, e arrastar o dedo vira para os lados;
-  - **dedo:** arrastar o dedo faz tudo. Funciona em qualquer aparelho.
-- **Recomeçar** devolve você ao portão, as armas à areia e faz da direção atual do celular a "frente".
+  - **giroscópio:** a vista acompanha a cabeça em todas as direções;
+  - **bússola** (aparece no lugar do giroscópio em aparelho **sem giroscópio** que tenha bússola): a vista também acompanha a cabeça, mas com menos firmeza, e ímãs por perto atrapalham;
+  - **inclinar** (só acelerômetro): olhar para cima e para baixo acompanha a cabeça; para virar, incline a cabeça para o ombro do lado desejado (a vista gira enquanto a cabeça estiver inclinada);
+  - **dedo:** arrastar o dedo na tela faz tudo. Serve fora do óculos.
+- **Recomeçar** devolve você ao portão e as armas à areia.
 
-O cenário é simples de propósito: areia, muro, arquibancada, portão, duas bandeiras, sol e nuvem. A arena inteira é uma chamada de desenho e o céu é outra.
+A linha pequena no alto mostra, medidos separadamente: quadros por segundo da tela (e o tempo de desenho de um quadro), quadros por segundo da câmera, quantas vezes por segundo as mãos foram de fato atualizadas, o tempo das redes, o atraso entre a foto e o resultado, quantas mãos estão em cena e onde o rastreamento roda (`CPU leve` quer dizer CPU com o modelo leve).
+
+O cenário é simples de propósito: areia, muro, arquibancada, portão, duas bandeiras, sol e nuvem. A arena inteira é uma chamada de desenho por olho e o céu é outra.
+
+### O que mudou no rastreamento para o Coliseu
+
+- **Modelo leve.** O Coliseu usa o detector de palma normal com a rede de pontos "lite" do MediaPipe, montados em `hand_landmarker_lite.task` na compilação. No computador, a rede lite custou perto da metade do tempo por mão e achou a mão nas mesmas fotos que a completa. O Mini Pots continua com o modelo completo.
+- **Duas mãos sem pagar por duas o tempo todo.** Pedir duas mãos ao MediaPipe faz o detector de palma (a parte cara) rodar em todo quadro enquanto só uma mão está em cena. Por isso, com uma mão só, roda o rastreador de uma mão, e o de duas só é consultado a cada 350 ms para ver se a outra apareceu.
+- **A tela não espera a mão, e a mão não pula.** Cada mão passa por um filtro que tira o tremor quando ela está parada e deixa passar o movimento rápido; entre dois resultados a mão segue com a velocidade que tinha, por no máximo um instante. O comprimento dos ossos é mantido constante, para os dedos não esticarem e encolherem.
+- **Esquerda e direita não trocam.** Cada mão é ligada à que estava mais perto no resultado anterior, não à ordem em que o MediaPipe as devolve.
 
 ## Como o rastreamento foi pensado para celular fraco
 
@@ -68,7 +88,7 @@ A qualidade depende da luz: com pouca luz a câmera borra o movimento e o rastre
 
 O rastreamento não pôde ser testado em aparelho neste repositório: a compilação e os testes de unidade rodam no GitHub Actions, mas os números de fps e Hz precisam ser conferidos no seu celular (eles aparecem na tela).
 
-O Coliseu também não foi jogado em aparelho. As regras (andar, pegar, soltar, golpes, modos de olhar) têm testes de unidade, e o desenho foi conferido no computador com um substituto da GPU, mas três coisas só o celular mostra: se a distância da mão, estimada pelo tamanho dela na imagem, deixa o chão fácil de alcançar; se a mão 3D aparece virada do jeito certo nas duas câmeras; e se os sensores de cada aparelho dão a direção esperada.
+O Coliseu também não foi jogado em aparelho, nem visto dentro de um óculos. As regras (andar com as duas mãos, pegar, soltar, arremessar, golpes, modos de olhar, as duas imagens) têm testes de unidade, e o desenho foi conferido no computador com um substituto da GPU. O que só o celular mostra: quantos quadros por segundo o rastreamento alcança com o modelo leve; se a distância das mãos, estimada pelo tamanho delas na imagem, deixa o chão fácil de alcançar; se o lado da palma e o das costas da mão saem certos (isso vem do rótulo "esquerda/direita" do MediaPipe); se os sensores de cada aparelho dão a direção esperada com o celular deitado; e se os valores padrão de DIP e de lente servem para o seu óculos. Não há correção da distorção das lentes: as bordas da imagem podem parecer curvas.
 
 ## Compilação
 
@@ -78,6 +98,6 @@ Requisitos: JDK 17, Android SDK com plataforma 35 e acesso à internet. Na raiz:
 ./gradlew testDebugUnitTest assembleDebug
 ```
 
-Na primeira compilação o Gradle baixa o modelo `hand_landmarker.task` (cerca de 7,8 MB) do repositório oficial do MediaPipe para `app/src/main/assets/` e confere o SHA-256. O arquivo não fica no Git.
+Na primeira compilação o Gradle baixa o modelo `hand_landmarker.task` (cerca de 7,8 MB) do repositório oficial do MediaPipe para `app/src/main/assets/` e confere o SHA-256. Baixa também as duas redes do modelo leve (detector de palma e rede de pontos "lite", cerca de 4,4 MB juntas), confere o SHA-256 de cada uma e as junta em `hand_landmarker_lite.task`. Se essa segunda parte falhar, a compilação continua com um aviso e o Coliseu usa o modelo completo. Os arquivos não ficam no Git.
 
 O resultado é `app/build/outputs/apk/debug/app-debug.apk`, assinado com a chave de depuração do Android. O workflow **Android APK** roda os testes, compila e publica o artefato `mini-pots-ar-debug` no GitHub Actions. Um APK de depuração é instalável, mas não é uma versão de produção assinada.

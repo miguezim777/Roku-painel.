@@ -6,3 +6,5 @@ local.properties
 # Downloaded by Gradle at build time (see app/build.gradle.kts).
 app/src/main/assets/hand_landmarker.task
 app/src/main/assets/hand_landmarker.task.tmp
+app/src/main/assets/hand_landmarker_lite.task
+app/src/main/assets/hand_landmarker_lite.task.tmp

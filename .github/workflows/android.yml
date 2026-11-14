@@ -32,8 +32,8 @@ jobs:
             unzip -l "$apk" > apk-contents.txt
             grep -E "assets/|lib/" apk-contents.txt || true
             ls -l "$apk"
-            # The model and the MediaPipe library for both phone ABIs must be inside the APK.
-            for entry in 'assets/hand_landmarker\.task' 'lib/arm64-v8a/libmediapipe_tasks.*\.so' 'lib/armeabi-v7a/libmediapipe_tasks.*\.so'; do
+            # The models and the MediaPipe library for both phone ABIs must be inside the APK.
+            for entry in 'assets/hand_landmarker\.task' 'assets/hand_landmarker_lite\.task' 'lib/arm64-v8a/libmediapipe_tasks.*\.so' 'lib/armeabi-v7a/libmediapipe_tasks.*\.so'; do
               grep -qE " $entry\$" apk-contents.txt || { echo "error: missing from APK: $entry"; exit 1; }
             done
           } 2>&1 | tee -a build.log

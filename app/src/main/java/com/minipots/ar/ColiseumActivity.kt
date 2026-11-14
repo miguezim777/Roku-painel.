@@ -10,11 +10,14 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.util.Size
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -36,12 +39,18 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * The coliseum game. The screen shows only the arena; the camera is used to follow one hand, and
- * the motion sensors (or the finger, on phones without a gyroscope) to look around.
+ * The coliseum game, made to be played with the phone in goggles (VR Box and the like): the
+ * screen lies on its side and shows the arena twice, once for each eye. The camera on the back
+ * follows both hands, and the motion sensors follow the head.
+ *
+ * Inside goggles nobody reaches the screen, so the controls are for before the phone goes in, and
+ * the volume keys do what is needed afterwards: up looks straight ahead again, down shows or hides
+ * the controls.
  */
 class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTracker.Listener, SensorEventListener {
     private lateinit var surface: GLSurfaceView
@@ -51,6 +60,15 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     private lateinit var status: TextView
     private lateinit var stats: TextView
     private lateinit var lookButton: Button
+    private lateinit var stereoButton: Button
+    private lateinit var ipdLabel: Button
+    private lateinit var overlay: LinearLayout
+    private var stereoOn = true
+    private var ipdMm = 63
+    private var lensMm = 42
+    private var quarterTurns = 1
+    private var compass = false
+    private var dragged = false
     private lateinit var analysisExecutor: ExecutorService
     private lateinit var settings: SharedPreferences
     private lateinit var sensorManager: SensorManager
@@ -71,7 +89,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     private var sensorsOn = false
     private val rotationVector = FloatArray(4)
     private val rotationMatrix = FloatArray(9)
-    private val lookOut = FloatArray(2)
+    private val lookOut = FloatArray(3)
     private var gravityX = 0f
     private var gravityY = 0f
     private var gravityZ = 0f
@@ -88,16 +106,19 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         super.onCreate(savedInstanceState)
         // The game is played with the hand in the air: without this the screen would switch off.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN
+        hideSystemBars()
 
         settings = getSharedPreferences("settings", Context.MODE_PRIVATE)
+        stereoOn = settings.getBoolean(KEY_STEREO, true)
+        ipdMm = settings.getInt(KEY_IPD, 63).coerceIn(MIN_IPD_MM, MAX_IPD_MM)
+        lensMm = settings.getInt(KEY_LENS, 42).coerceIn(MIN_LENS_MM, MAX_LENS_MM)
         findLookModes()
 
         analysisExecutor = Executors.newSingleThreadExecutor { Thread(it, "hand-tracking") }
-        tracker = HandTracker(this, this)
-        // Without a preview the tracker sees the whole upright camera picture, which is 3:4.
-        tracker.viewAspect = .75f
+        // Both hands, with the lighter of the two hand models.
+        tracker = HandTracker(this, this, hands = 2, modelAsset = HandTracker.LIGHT_MODEL_ASSET)
+        // The picture is not shown; this only matters to the single-hand readings, unused here.
+        tracker.viewAspect = 4f / 3f
         processorSetting = ProcessorSetting(this, tracker) { message -> renderer.showNotice(message) }
         renderer = ColiseumRenderer(tracker, sensorLook, this, chooseProcessor = processorSetting.automatic)
         renderer.lookMode = lookMode
@@ -111,17 +132,20 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
-        // A finger dragged over the picture turns the view.
+        // A finger dragged over the picture turns the view; a tap shows or hides the controls.
         surface.setOnTouchListener { view, event ->
             when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { touchX = event.x; touchY = event.y }
+                MotionEvent.ACTION_DOWN -> { touchX = event.x; touchY = event.y; dragged = false }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.x - touchX) / view.width.coerceAtLeast(1)
                     val dy = (event.y - touchY) / view.height.coerceAtLeast(1)
-                    touchX = event.x; touchY = event.y
-                    surface.queueEvent { renderer.drag(dx, dy) }
+                    if (dragged || abs(dx) + abs(dy) > .02f) {
+                        dragged = true
+                        touchX = event.x; touchY = event.y
+                        surface.queueEvent { renderer.drag(dx, dy) }
+                    }
                 }
-                MotionEvent.ACTION_UP -> view.performClick()
+                MotionEvent.ACTION_UP -> { if (!dragged) toggleControls(); view.performClick() }
             }
             true
         }
@@ -129,20 +153,20 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
 
         val root = FrameLayout(this)
         root.addView(surface)
-        val overlay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        overlay = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val title = TextView(this).apply {
-            text = "COLISEU"; textSize = 20f; setTextColor(Color.WHITE)
+            text = "COLISEU  "; textSize = 16f; setTextColor(Color.WHITE)
             setShadowLayer(4f, 0f, 1f, Color.BLACK)
         }
         stats = TextView(this).apply {
-            textSize = 12f; setTextColor(Color.WHITE); gravity = Gravity.END
+            textSize = 11f; setTextColor(Color.WHITE); gravity = Gravity.END
             setShadowLayer(4f, 0f, 1f, Color.BLACK)
         }
         header.addView(title, LinearLayout.LayoutParams(-2, -2))
         header.addView(stats, LinearLayout.LayoutParams(0, -2, 1f))
         status = TextView(this).apply {
-            textSize = 14f; setTextColor(Color.WHITE); setPadding(12, 10, 12, 10)
+            textSize = 13f; setTextColor(Color.WHITE); setPadding(12, 8, 12, 8)
             setBackgroundColor(0x99301c0e.toInt())
         }
         overlay.addView(header); overlay.addView(status)
@@ -154,6 +178,14 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
             line.addView(b, LinearLayout.LayoutParams(-2, -2))
             return b
         }
+        button("Esconder") { toggleControls() }
+        button("Recentrar") { surface.queueEvent { renderer.recentre() } }
+        stereoButton = button(stereoLabel()) { stereoOn = !stereoOn; saveStereo() }
+        button("DIP −") { ipdMm = (ipdMm - 1).coerceAtLeast(MIN_IPD_MM); saveStereo() }
+        ipdLabel = button(ipdText()) { ipdMm = 63; lensMm = 42; saveStereo() }
+        button("DIP +") { ipdMm = (ipdMm + 1).coerceAtMost(MAX_IPD_MM); saveStereo() }
+        button("Escala −") { lensMm = (lensMm - 2).coerceAtLeast(MIN_LENS_MM); saveStereo() }
+        button("Escala +") { lensMm = (lensMm + 2).coerceAtMost(MAX_LENS_MM); saveStereo() }
         lookButton = button(lookLabel()) { nextLookMode() }
         button("Recomeçar") { surface.queueEvent { renderer.restart() } }
         button("Câmera ⟲") { frontCamera = !frontCamera; bindCamera() }
@@ -165,7 +197,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         overlay.isClickable = false
         ViewCompat.setOnApplyWindowInsetsListener(overlay) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
-            view.setPadding(bars.left + 12, bars.top + 15, bars.right + 12, bars.bottom + 14)
+            view.setPadding(bars.left + 12, bars.top + 8, bars.right + 12, bars.bottom + 8)
             insets
         }
         setContentView(root)
@@ -201,6 +233,57 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
 
     private fun showStatus(message: String) { if (lastStatus != message) { lastStatus = message; status.text = message } }
 
+    // ---------------------------------------------------------------- the two pictures
+
+    @Suppress("DEPRECATION")
+    private fun hideSystemBars() {
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    private fun stereoLabel() = if (stereoOn) "VR: ligado" else "VR: desligado"
+    private fun ipdText() = "DIP $ipdMm mm · lente $lensMm mm"
+
+    private fun toggleControls() {
+        overlay.visibility = if (overlay.visibility == View.VISIBLE) View.INVISIBLE else View.VISIBLE
+    }
+
+    private fun saveStereo() {
+        settings.edit().putBoolean(KEY_STEREO, stereoOn).putInt(KEY_IPD, ipdMm).putInt(KEY_LENS, lensMm).apply()
+        stereoButton.text = stereoLabel(); ipdLabel.text = ipdText()
+        applyStereo()
+    }
+
+    /**
+     * Width of the screen in metres, which decides where each lens looks at it. Phones report
+     * their dots per inch; a value that cannot be true is replaced by a common screen size.
+     */
+    private fun screenWidthMetres(): Float {
+        val metrics = resources.displayMetrics
+        val pixels = if (viewWidth > 0) viewWidth else metrics.widthPixels
+        val dpi = metrics.xdpi
+        val metres = if (dpi > 50f) pixels / dpi * .0254f else 0f
+        return if (metres in .09f..(.20f)) metres else .14f
+    }
+
+    private fun applyStereo() {
+        val on = stereoOn; val ipd = ipdMm / 1000f; val lens = lensMm / 1000f; val width = screenWidthMetres()
+        surface.queueEvent { renderer.setStereo(on, ipd, lens, width) }
+    }
+
+    /** Volume up looks straight ahead again; volume down shows or hides the controls. */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) { surface.queueEvent { renderer.recentre() }; return true }
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) { toggleControls(); return true }
+        return super.onKeyDown(keyCode, event)
+    }
+
     // ---------------------------------------------------------------- looking around
 
     /**
@@ -215,6 +298,12 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
             rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
                 ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
         }
+        if (rotationSensor == null) {
+            // No gyroscope: the compass and the accelerometer together still tell where the head
+            // is turned, only less steadily.
+            rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR)
+            compass = rotationSensor != null
+        }
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         if (rotationSensor != null) lookModes.add(LookMode.GYROSCOPE)
         if (accelerometer != null) lookModes.add(LookMode.TILT)
@@ -224,8 +313,8 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     }
 
     private fun lookLabel() = when (lookMode) {
-        LookMode.GYROSCOPE -> "Olhar: giroscópio"
-        LookMode.TILT -> "Olhar: inclinar + dedo"
+        LookMode.GYROSCOPE -> if (compass) "Olhar: bússola" else "Olhar: giroscópio"
+        LookMode.TILT -> "Olhar: inclinar"
         LookMode.TOUCH -> "Olhar: dedo"
     }
 
@@ -236,8 +325,9 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         if (sensorsOn) { stopSensors(); startSensors() }
         renderer.lookMode = lookMode
         renderer.showNotice(when (lookMode) {
-            LookMode.GYROSCOPE -> "Olhar com o giroscópio: gire o celular. Arrastar o dedo na tela também vira."
-            LookMode.TILT -> "Sem giroscópio: incline o celular para olhar para cima e para baixo e arraste o dedo na tela para virar."
+            LookMode.GYROSCOPE -> if (compass) "Sem giroscópio: a bússola acompanha a cabeça, com menos firmeza. Gire a cabeça para olhar em volta."
+                else "Olhar com o giroscópio: gire a cabeça. Arrastar o dedo na tela também vira."
+            LookMode.TILT -> "Sem giroscópio: olhe para cima e para baixo normalmente; para virar, incline a cabeça para o lado (ou arraste o dedo na tela)."
             LookMode.TOUCH -> "Olhar com o dedo: arraste na tela para olhar em volta."
         })
     }
@@ -246,6 +336,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         sensorsOn = true
         sensorLook.ready = false
         gravityNs = 0L
+        syncRotation()
         val sensor = when (lookMode) {
             LookMode.GYROSCOPE -> rotationSensor
             LookMode.TILT -> accelerometer
@@ -262,7 +353,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     override fun onSensorChanged(event: SensorEvent) {
         val values = event.values
         when (event.sensor.type) {
-            Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_ROTATION_VECTOR -> {
+            Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> {
                 if (lookMode != LookMode.GYROSCOPE || values.size < 3) return
                 // Some phones add an accuracy value at the end, which older systems reject.
                 val count = min(values.size, 4)
@@ -272,8 +363,19 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
                     // Three values: the fourth is implied. The array handed over must have exactly three.
                     SensorManager.getRotationMatrixFromVector(rotationMatrix, floatArrayOf(values[0], values[1], values[2]))
                 }
-                Look.fromRotationMatrix(rotationMatrix, lookOut)
-                sensorLook.yaw = lookOut[0]; sensorLook.pitch = lookOut[1]; sensorLook.ready = true
+                Look.headFromRotationMatrix(rotationMatrix, quarterTurns, lookOut)
+                if (compass && sensorLook.ready) {
+                    // The compass trembles: only its slow part is followed.
+                    val dt = if (gravityNs == 0L) 0f else (event.timestamp - gravityNs) / 1e9f
+                    val k = if (dt <= 0f || dt > .5f) 1f else dt / (COMPASS_SMOOTHING_SECONDS + dt)
+                    sensorLook.yaw += Look.angleDifference(lookOut[0], sensorLook.yaw) * k
+                    sensorLook.pitch += (lookOut[1] - sensorLook.pitch) * k
+                    sensorLook.roll += Look.angleDifference(lookOut[2], sensorLook.roll) * k
+                } else {
+                    sensorLook.yaw = lookOut[0]; sensorLook.pitch = lookOut[1]; sensorLook.roll = lookOut[2]
+                }
+                gravityNs = event.timestamp
+                sensorLook.ready = true
             }
             Sensor.TYPE_ACCELEROMETER -> {
                 if (lookMode != LookMode.TILT || values.size < 3) return
@@ -284,7 +386,9 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
                 gravityX += (values[0] - gravityX) * k
                 gravityY += (values[1] - gravityY) * k
                 gravityZ += (values[2] - gravityZ) * k
-                sensorLook.pitch = Look.pitchFromGravity(gravityX, gravityY, gravityZ)
+                lookOut[1] = sensorLook.pitch; lookOut[2] = sensorLook.roll
+                Look.tiltFromGravity(gravityX, gravityY, gravityZ, quarterTurns, lookOut)
+                sensorLook.pitch = lookOut[1]; sensorLook.roll = lookOut[2]
                 sensorLook.ready = true
             }
         }
@@ -316,6 +420,48 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         if (width > MAX_RENDER_WIDTH) {
             surface.holder.setFixedSize(MAX_RENDER_WIDTH, (height.toFloat() * MAX_RENDER_WIDTH / width).roundToInt())
         } else surface.holder.setSizeFromLayout()
+        applyStereo()
+        syncRotation()
+    }
+
+    /**
+     * The screen turns on its side a moment after this screen opens. Whatever was started before
+     * that must be told: the camera, so its picture is upright for the tracker, and the sensors,
+     * so "up" is the edge of the phone that is up now.
+     */
+    private fun syncRotation() {
+        @Suppress("DEPRECATION")
+        val rotation = windowManager.defaultDisplay.rotation
+        quarterTurns = rotation
+        try { boundAnalysis?.targetRotation = rotation } catch (_: Exception) {}
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        syncRotation()
+    }
+
+    /**
+     * Focal length of the camera in units of the long side of its picture, from what the phone
+     * says about its lens and sensor. It turns the place of a hand in the picture into a
+     * direction. Falls back to a typical phone camera.
+     */
+    private fun cameraFocal(front: Boolean): Float {
+        try {
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val facing = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+            for (id in manager.cameraIdList) {
+                val c = manager.getCameraCharacteristics(id)
+                if (c.get(CameraCharacteristics.LENS_FACING) != facing) continue
+                val lengths = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS) ?: break
+                val sensor = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: break
+                if (lengths.isEmpty() || sensor.width <= 0f) break
+                val focal = lengths[0] / sensor.width
+                // The first camera on that side is the one CameraX opens.
+                return if (focal in .5f..(1.1f)) focal else HandTracker.DEFAULT_FOCAL
+            }
+        } catch (_: Exception) {}
+        return HandTracker.DEFAULT_FOCAL
     }
 
     /** The camera only feeds the hand tracker; its picture is not shown. */
@@ -344,6 +490,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
                 .build()
             // The front camera is a mirror: the hand moves the way its reflection would.
             tracker.mirror = frontCamera
+            tracker.focal = cameraFocal(frontCamera)
             analysis.setAnalyzer(analysisExecutor, tracker)
             provider.unbindAll()
             provider.bindToLifecycle(this, if (frontCamera) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA, analysis)
@@ -394,8 +541,18 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     }
 
     private companion object {
-        const val MAX_RENDER_WIDTH = 720
-        const val KEY_LOOK = "look"
+        /** Both pictures together: 640 pixels across for each eye. */
+        const val MAX_RENDER_WIDTH = 1280
+        // Not the key of the version held in the hand: inside goggles the best way to look is another.
+        const val KEY_LOOK = "look_vr"
+        const val KEY_STEREO = "stereo"
+        const val KEY_IPD = "ipd_mm"
+        const val KEY_LENS = "lens_mm"
+        const val MIN_IPD_MM = 52
+        const val MAX_IPD_MM = 74
+        const val MIN_LENS_MM = 28
+        const val MAX_LENS_MM = 70
+        const val COMPASS_SMOOTHING_SECONDS = .25f
         /** Time over which the accelerometer is averaged to find gravity. */
         const val GRAVITY_SMOOTHING_SECONDS = .12f
     }
