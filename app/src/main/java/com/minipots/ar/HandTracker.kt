@@ -134,6 +134,12 @@ class HandTracker(
     @Volatile var frameCostMs = 0f
     /** Smoothed time between two results while a hand is followed, in milliseconds. */
     @Volatile var intervalMs = 0f
+    /**
+     * Follow one hand only, although the tracker was made for two. Every frame then costs what a
+     * single hand costs; the search for the second hand, which is the expensive part, never runs.
+     * Has no effect on the GPU, where there is one tracker only.
+     */
+    @Volatile var oneHandOnly = false
     /** Asks for the networks to run on the GPU. Falls back to the CPU by itself if that fails. */
     @Volatile var preferGpu = false
     /** Where the networks run now. */
@@ -337,7 +343,9 @@ class HandTracker(
     /** The tracker for this frame: the one for two hands or the one for a single hand (see [TrackerChoice]). */
     private fun chooseLandmarker(nowNs: Long): HandLandmarker? {
         val one = single ?: return landmarker
-        return if (choice.forTwo(nowNs)) landmarker else one
+        // With one hand asked for, the tracker for two is never consulted: no time goes into
+        // looking for a second hand.
+        return if (!oneHandOnly && choice.forTwo(nowNs)) landmarker else one
     }
 
     /** The model asked for, or the full one when the APK was built without the lighter one. */

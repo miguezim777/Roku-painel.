@@ -343,6 +343,14 @@ class HandRig {
     /** Readings held back as jumps since the start. */
     var rejected = 0
         private set
+    /**
+     * Where the newest reading has the middle of the palm, moved on by its speed: [joints] close
+     * in on this over a few frames. Along the same axes as [joints].
+     */
+    val target = FloatArray(3)
+    /** Readings in a row since the hand was found, or found again somewhere else. */
+    var readings = 0
+        private set
 
     private val raw = FloatArray(HAND_POINTS * 3)
     private val shape = FloatArray(HAND_POINTS * 3)
@@ -366,9 +374,19 @@ class HandRig {
     private var following = false
     private var heldBack = 0
     private var shown = false
+    private var restart = false
+    private var settle = 0f
+    /**
+     * True while the hand is on its way to a new place without having moved there: found again
+     * after its readings had stopped, or found somewhere else. Whatever the hand held on to, it
+     * has let go of, and this way is not a movement.
+     */
+    var restarted = false
+        private set
 
     fun reset() {
-        state = State.LOST; confidence = 0f; closed = false; following = false; shown = false; heldBack = 0
+        state = State.LOST; confidence = 0f; closed = false; following = false; shown = false; heldBack = 0; readings = 0
+        restart = false; restarted = false; settle = 0f
         lastSampleNs = 0L; interval = 0f; size = 0f
         fist.reset(); velocity.fill(0f)
     }
@@ -399,8 +417,9 @@ class HandRig {
             if (dt <= 0f) return
             val dx = x - rawX; val dy = y - rawY; val dz = z - rawZ
             val jump = sqrt(dx * dx + dy * dy + dz * dz)
-            if (dt > hold()) {
-                // Back after a loss: a new start, nothing is carried over.
+            if (dt > (if (interval > 0f) fresh() else hold() * .6f)) {
+                // Back after its readings had stopped for a while: a new start, nothing is
+                // carried over. Where it is now says nothing about how it got there.
                 following = false; dt = 0f
             } else if (jump > JUMP_METRES + JUMP_SPEED * dt) {
                 if (heldBack < MAX_HELD_BACK) { heldBack++; rejected++; return }
@@ -414,6 +433,10 @@ class HandRig {
             depthFilter.reset()
             for (f in shapeFilters) f.reset()
             velocity.fill(0f)
+            readings = 0
+            // The drawn hand closes in on the new place over a few frames, and those frames are
+            // marked: the way from the old place to the new one is not a movement of the hand.
+            restart = true
         } else {
             interval = if (interval == 0f) dt else interval + (dt - interval) * .2f
         }
@@ -462,6 +485,7 @@ class HandRig {
         closed = fist.update(HandShape.closedRatio(r.world))
         palmSign = r.palmSign
         following = true
+        readings++
         lastSampleNs = timeNs
     }
 
@@ -482,13 +506,14 @@ class HandRig {
 
     /** Brings [joints], [state] and [confidence] up to [nowNs]. [dt] is the time since the last drawn frame. */
     fun advance(nowNs: Long, dt: Float) {
+        if (restart) { restart = false; settle = if (shown) SETTLE_SECONDS else 0f }
+        restarted = settle > 0f
+        if (settle > 0f) settle -= dt
         if (!following) { lose(); return }
         val age = (nowNs - lastSampleNs) / 1e9f
         val hold = hold()
         if (age > hold) { lose(); return }
-        // Up to two readings in a row may be missing, or one may take three times as long (the
-        // look for the second hand does), before the hand counts as held.
-        val fresh = (if (interval > 0f) interval * FRESH_READINGS else .10f).coerceIn(.10f, hold * .6f)
+        val fresh = fresh()
         if (age <= fresh) { state = State.TRACKED; confidence = 1f }
         else { state = State.HELD; confidence = (1f - (age - fresh) / (hold - fresh)).coerceIn(0f, 1f) }
 
@@ -498,6 +523,7 @@ class HandRig {
         val sure = ((speed - PREDICT_FROM) / (PREDICT_FULLY - PREDICT_FROM)).coerceIn(0f, 1f)
         val lead = min(max(age, 0f), MAX_LEAD_SECONDS) * sure
         val px = centreX + velocity[0] * lead; val py = centreY + velocity[1] * lead; val pz = centreZ + velocity[2] * lead
+        target[0] = px; target[1] = py; target[2] = pz
         // A new reading never makes the drawn hand jump: it closes in over a few frames.
         val k = if (!shown || dt <= 0f) 1f else 1f - exp(-dt / GLIDE_SECONDS)
         val form = if (steady) turned else shape
@@ -515,17 +541,23 @@ class HandRig {
      */
     private fun hold() = max(HOLD_SECONDS, min(interval * HOLD_READINGS, MAX_HOLD_SECONDS))
 
+    /**
+     * How old the last reading can be for the hand to count as followed: up to two readings in a
+     * row may be missing, or one may take three times as long (the look for the second hand does).
+     */
+    private fun fresh() = (if (interval > 0f) interval * FRESH_READINGS else .10f).coerceIn(.10f, hold() * .6f)
+
     private fun lose() {
-        state = State.LOST; confidence = 0f; shown = false
+        state = State.LOST; confidence = 0f; shown = false; readings = 0
         if (following) { following = false; fist.reset(); closed = false; velocity.fill(0f); interval = 0f }
     }
 
     companion object {
         /** The last pose is kept at least this long after the last reading. */
-        const val HOLD_SECONDS = .9f
+        const val HOLD_SECONDS = 1.5f
         /** The longest the last pose is ever kept. */
-        const val MAX_HOLD_SECONDS = 2f
-        private const val HOLD_READINGS = 5f
+        const val MAX_HOLD_SECONDS = 3f
+        private const val HOLD_READINGS = 8f
         private const val FRESH_READINGS = 3f
         private const val VELOCITY_RATE = .8f
         /** Longest time the hand is moved on beyond its last reading. */
@@ -537,6 +569,8 @@ class HandRig {
         private const val PREDICT_FROM = .12f
         private const val PREDICT_FULLY = .45f
         private const val GLIDE_SECONDS = .025f
+        /** The time the drawn hand takes to arrive at a new place: four times [GLIDE_SECONDS]. */
+        private const val SETTLE_SECONDS = .1f
         /** Filters want speeds in hand sizes (about 9 cm) per second. */
         private const val SPEED_SCALE = 11f
         private const val DEPTH_SPEED_SCALE = 5f
@@ -900,8 +934,15 @@ class GorillaBody {
     private val hasBefore = booleanArrayOf(false, false)
     private val usable = booleanArrayOf(false, false)
     private val handSpeed = FloatArray(6)
-    /** The hand was seen clear of everything since it was last believed: it can arrive at a surface. */
-    private val free = booleanArrayOf(false, false)
+    /** Where the newest reading has each hand, when that is known apart from where the hand is drawn. */
+    private val aim = FloatArray(6)
+    private var aimed = false
+    /**
+     * Seconds between two readings of the hands, 0 when unknown. The speed the body leaves with
+     * is taken over a little more than this, so it is the speed of the hand from one reading to
+     * the next and not that of the short dash with which the hand catches up with a new reading.
+     */
+    var readingInterval = 0f
     /** The hand has been below the eyes without going down fast: a push down from here is a jump. */
     private val ready = booleanArrayOf(false, false)
     private var sinceJump = JUMP_INTERVAL
@@ -915,7 +956,7 @@ class GorillaBody {
     }
 
     private fun release() {
-        for (i in 0..1) { touching[i] = false; stroking[i] = false; hasBefore[i] = false; free[i] = false; ready[i] = false }
+        for (i in 0..1) { touching[i] = false; stroking[i] = false; hasBefore[i] = false; ready[i] = false }
         handSpeed.fill(0f); historyCount = 0; historyNext = 0
     }
 
@@ -924,8 +965,10 @@ class GorillaBody {
      * eyes in world axes (x, y, z per hand). A hand that is not [present] is ignored; one that is
      * present but not [live] is only drawn.
      */
-    fun update(dt: Float, world: ArenaWorld, present: BooleanArray, live: BooleanArray, offsets: FloatArray) {
+    fun update(dt: Float, world: ArenaWorld, present: BooleanArray, live: BooleanArray, offsets: FloatArray, targets: FloatArray? = null) {
         if (dt <= 0f) return
+        aimed = targets != null
+        if (targets != null) System.arraycopy(targets, 0, aim, 0, 6)
         // A frame that took very long is not made up for: the rest of its time is dropped.
         accumulator = min(accumulator + dt, STEP * MAX_STEPS)
         val count = ((accumulator + STEP * 1e-3f) / STEP).toInt()
@@ -952,6 +995,14 @@ class GorillaBody {
         for (i in 0..1) {
             if (touching[i]) { hand[i * 3] = pin[i * 3]; hand[i * 3 + 1] = pin[i * 3 + 1]; hand[i * 3 + 2] = pin[i * 3 + 2] }
             else { hand[i * 3] = x + offsets[i * 3]; hand[i * 3 + 1] = y + offsets[i * 3 + 1]; hand[i * 3 + 2] = z + offsets[i * 3 + 2] }
+            if (!present[i]) continue
+            // A hand is never drawn inside a thing: whatever the camera makes of its distance, it
+            // is shown on the surface. Twice, for the corner between the sand and a wall.
+            for (pass in 0..1) {
+                val d = world.distance(hand[i * 3], hand[i * 3 + 1], hand[i * 3 + 2]) - handRadius
+                if (d >= 0f) break
+                hand[i * 3] -= world.normal[0] * d; hand[i * 3 + 1] -= world.normal[1] * d; hand[i * 3 + 2] -= world.normal[2] * d
+            }
         }
     }
 
@@ -992,27 +1043,40 @@ class GorillaBody {
         var mx = 0f; var my = 0f; var mz = 0f
         for (i in 0..1) {
             stroking[i] = false
+            // Whether it is known where the hand was a step ago: if not, it has only just appeared.
+            val known = hasBefore[i]
             val ok = believable(i)
             if (usable[i]) remember(i)
-            if (!ok) { if (touching[i]) { touching[i] = false; lost = true }; free[i] = false; continue }
+            if (!ok) { if (touching[i]) { touching[i] = false; lost = true }; continue }
             val qx = x + at[i * 3]; val qy = y + at[i * 3 + 1]; val qz = z + at[i * 3 + 2]
             val d = world.distance(qx, qy, qz) - handRadius
-            if (d > TOUCH_MARGIN) free[i] = true
             if (!touching[i]) {
-                // A hand takes hold where it arrives at a surface. One that turns up already deep
-                // inside something (found again there, or put there by a wrong reading) did not
-                // arrive: it holds nothing until it has come out.
-                if (d <= TOUCH_MARGIN && (free[i] || d >= -MAX_START_DEPTH)) {
-                    // First touch: the hand stays on the surface, where it came in.
+                if (d <= TOUCH_MARGIN) {
                     touching[i] = true
-                    pin[i * 3] = qx - world.normal[0] * d; pin[i * 3 + 1] = qy - world.normal[1] * d
-                    pin[i * 3 + 2] = qz - world.normal[2] * d
+                    if (known && d >= -MAX_START_DEPTH) {
+                        // The hand arrived at the surface: it is held where it came in.
+                        pin[i * 3] = qx - world.normal[0] * d; pin[i * 3 + 1] = qy - world.normal[1] * d
+                        pin[i * 3 + 2] = qz - world.normal[2] * d
+                    } else {
+                        // The hand is first seen inside the thing, or found again there. The player
+                        // feels no floor and a camera is unsure of distance, so this happens all
+                        // the time. It holds from where it is: what it does from here on moves
+                        // the body, and the way it got in does not (that would throw the body up).
+                        pin[i * 3] = qx; pin[i * 3 + 1] = qy; pin[i * 3 + 2] = qz
+                    }
                     if (!wasHeld && held == 0) { historyCount = 0; historyNext = 0 }
                 }
             } else {
                 val ex = pin[i * 3] - qx; val ey = pin[i * 3 + 1] - qy; val ez = pin[i * 3 + 2] - qz
                 // Lifted off the surface, or pulled further than an arm can be from where it holds.
                 if (d > RELEASE_DISTANCE || ex * ex + ey * ey + ez * ez > UNSTICK_DISTANCE * UNSTICK_DISTANCE) touching[i] = false
+                else if (aimed) {
+                    // The newest reading has the hand off the surface already, and the drawn hand
+                    // is only on its way there: it has let go. Dragging the body along with the
+                    // way out would undo the stroke.
+                    val ax = x + aim[i * 3]; val ay = y + aim[i * 3 + 1]; val az = z + aim[i * 3 + 2]
+                    if (world.distance(ax, ay, az) - handRadius > RELEASE_DISTANCE) touching[i] = false
+                }
             }
             if (touching[i]) {
                 mx += pin[i * 3] - qx; my += pin[i * 3 + 1] - qy; mz += pin[i * 3 + 2] - qz
@@ -1035,9 +1099,18 @@ class GorillaBody {
             historyZ[historyNext] = (z - fromZ) / dt
             historyNext = (historyNext + 1) % HISTORY
             if (historyCount < HISTORY) historyCount++
+            // The speed over the last tenth of a second, or over a little more than the time
+            // between two readings when they come more slowly than that.
+            val wanted = max(HISTORY_STEPS, (readingInterval * HISTORY_READINGS / STEP).toInt())
+            val span = min(min(wanted, HISTORY), historyCount)
             var ax = 0f; var ay = 0f; var az = 0f
-            for (i in 0 until historyCount) { ax += historyX[i]; ay += historyY[i]; az += historyZ[i] }
-            vx = ax / historyCount; vy = ay / historyCount; vz = az / historyCount
+            for (k in 1..span) {
+                val i = (historyNext - k + HISTORY) % HISTORY
+                ax += historyX[i]; ay += historyY[i]; az += historyZ[i]
+            }
+            // A hold shorter than the span counts as if the body had stood still before it.
+            val over = max(span, min(wanted, HISTORY)).toFloat()
+            vx = ax / over; vy = ay / over; vz = az / over
         } else if (wasHeld) {
             // The last hand let go: the body keeps the speed the hands gave it.
             val gain = if (lost) 1f else JUMP_MULTIPLIER
@@ -1187,7 +1260,7 @@ class GorillaBody {
         const val FLUID_MAX_JUMP_SPEED = 5.5f
         /** The push of a jump can go on building for this long after the body has left the ground. */
         private const val FLUID_JUMP_BUILD = .15f
-        /** A hand found deeper than this inside something holds nothing until it has come out. */
+        /** A hand first seen deeper than this inside a thing did not arrive at its surface; see [stepContact]. */
         private const val MAX_START_DEPTH = .15f
         private const val FLUID_GAIN = 1f
         private const val FLUID_JUMP_GAIN = 1.2f
@@ -1201,7 +1274,11 @@ class GorillaBody {
         private const val JUMP_SPEED = 1.5f
         private const val REST_SPEED = .25f
         private const val STOP_SPEED = .06f
-        /** A tenth of a second of steps. */
-        private const val HISTORY = 12
+        /** A tenth of a second of steps: the speed of the body is taken over this at least. */
+        private const val HISTORY_STEPS = 12
+        /** Or over this many times the time between two readings of the hands, when that is longer. */
+        private const val HISTORY_READINGS = 1.25f
+        /** The longest it is ever taken over: half a second of steps. */
+        private const val HISTORY = 60
     }
 }

@@ -48,6 +48,8 @@ class ColiseumRenderer(
         fun processor(action: ProcessorChooser.Action, cpuMs: Float, gpuMs: Float, cpuFps: Float, gpuFps: Float)
         /** A blow landed on a dummy; [strength] is 0..1. */
         fun blow(strength: Float)
+        /** Once a second: the frames drawn in that second. */
+        fun frameRate(fps: Int)
     }
 
     /** How the player looks around. Set from the UI thread. */
@@ -235,12 +237,26 @@ class ColiseumRenderer(
             val input = inputs[i]
             input.present = shown
             // Only a hand whose readings are fresh moves the body; a held pose is just drawn.
-            input.live = rig.state == HandRig.State.TRACKED
+            // Nor does a hand in the frame in which it is put at a new place: it let go.
+            input.live = rig.state == HandRig.State.TRACKED && !rig.restarted
             input.closed = shown && rig.closed
+            // A hand that has only just been found, or found again somewhere else, is not yet
+            // sure enough to take things.
+            input.confidence = if (rig.readings >= 2) rig.confidence else rig.confidence * .5f
+            input.interval = rig.interval
+            input.aimed = shown
             if (!shown) continue
-            if (!steady) { System.arraycopy(rig.joints, 0, input.joints, 0, input.joints.size); continue }
+            if (!steady) {
+                System.arraycopy(rig.joints, 0, input.joints, 0, input.joints.size)
+                System.arraycopy(rig.target, 0, input.target, 0, 3)
+                continue
+            }
             // From the steady axes back to those of the camera as the head is turned now.
             val t = turnNow; val from = rig.joints; val to = input.joints
+            val ax = rig.target[0]; val ay = rig.target[1]; val az = rig.target[2]
+            input.target[0] = t[0] * ax + t[3] * ay + t[6] * az
+            input.target[1] = t[1] * ax + t[4] * ay + t[7] * az
+            input.target[2] = t[2] * ax + t[5] * ay + t[8] * az
             for (k in 0 until HAND_POINTS) {
                 val x = from[k * 3]; val y = from[k * 3 + 1]; val z = from[k * 3 + 2]
                 to[k * 3] = t[0] * x + t[3] * y + t[6] * z
@@ -280,7 +296,7 @@ class ColiseumRenderer(
             }
             armed -> "Golpes: ${game.blows} · Bonecos derrubados: ${game.dummiesDown}. Bata nos bonecos de palha. A arma fica na mão sozinha; para largar, feche a mão e abra."
             fluid -> "Modo fluido: com a mão abaixo dos olhos, puxe o ar para trás para ir para a frente (ou para um lado, para ir para o outro). Suba a mão até a altura dos olhos para trazê-la de volta. As mãos para baixo, de uma vez, pulam."
-            else -> "Olhe para baixo, encoste a mão no chão e puxe para andar (como no Gorilla Tag). Empurre o chão para pular; puxe a parede para baixo para subir. Encoste a mão no cabo de uma arma para pegar: não precisa segurar."
+            else -> "Para andar: olhe para o chão e leve a mão até ele, a uns 35 cm do rosto (aparece um círculo claro quando ela encosta). Puxe a mão para trás e o corpo vai para a frente. Empurre para baixo para pular. As armas só são pegas de perto: ande até elas e ponha a palma no cabo."
         })
     }
 
@@ -310,8 +326,22 @@ class ColiseumRenderer(
         val nativeMb = try { (Debug.getNativeHeapAllocatedSize() / 1_048_576L).toInt() } catch (_: Throwable) { -1 }
         val memory = if (nativeMb >= 0) "$heapMb+$nativeMb MB" else "$heapMb MB"
         val moving = if (game.body.mode == Locomotion.FLUID) "fluido" else "contato"
+        // Where each hand is over the ground: this is what tells whether the ground is in reach.
+        val ground = StringBuilder("chão")
+        for (i in 0..1) {
+            ground.append(if (i == 0) " E " else " D ")
+            if (!inputs[i].present) ground.append("–")
+            else if (game.body.touching[i]) ground.append("toca")
+            else {
+                val above = game.palm[i * 3 + 1] - game.world.floorAt(game.palm[i * 3], game.palm[i * 3 + 2]) - game.body.handRadius
+                ground.append((above * 100f).roundToInt()).append(" cm")
+            }
+            // The camera asked for more arm than there is: the hand was brought back.
+            if (inputs[i].present && game.armUsed[i] > 1f) ground.append(" (braço esticado)")
+        }
+        callbacks.frameRate(fps)
         callbacks.stats(
-            "tela $fps qps (${(drawMs * 10f).roundToInt() / 10f} ms) · quedas $droppedFrames · câmera $camera qps · rastreio $results Hz · " +
+            "$ground · tela $fps qps (${(drawMs * 10f).roundToInt() / 10f} ms) · quedas $droppedFrames · câmera $camera qps · rastreio $results Hz · " +
                 "rede $inference ms · atraso $delay · mãos ${tracker.handsInView} · $where · física ${(1f / GorillaBody.STEP).roundToInt()} Hz $moving · " +
                 "saltos de mão ${game.body.rejected + rigs[0].rejected + rigs[1].rejected} · mem $memory"
         )

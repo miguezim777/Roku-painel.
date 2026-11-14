@@ -421,6 +421,21 @@ class HandInput {
     var closed = false
     /** Its 21 points in camera space, in real metres. */
     val joints = FloatArray(HAND_POINTS * 3)
+    /**
+     * How sure the tracking is, 0 to 1: 1 for a hand that has been read at least twice in a row,
+     * less for one that has only just been found or whose pose is being held. Things are only
+     * taken by a hand that is sure.
+     */
+    var confidence = 1f
+    /**
+     * Where the newest reading has the middle of the palm, in camera space, when [aimed] is set.
+     * The points in [joints] close in on a new reading over a few frames, so the hand does not
+     * jump; this says where they are going.
+     */
+    val target = FloatArray(3)
+    var aimed = false
+    /** Seconds between two readings of this hand, 0 when unknown. */
+    var interval = 0f
 }
 
 /**
@@ -486,7 +501,15 @@ class Coliseum {
     /** How many times longer than at rest the bones of each arm are right now. */
     val armStretch = floatArrayOf(1f, 1f)
 
+    /** How far each hand is from its shoulder, as a part of the length of the arm: never more than 1. */
+    val armUsed = FloatArray(2)
+    /** How far the palm can be from the shoulder: the two bones of the arm, and no more. */
+    val armLength: Float get() = 2f * ArmPose.BONE * reach / ARM_SCALE
+
     private val offsets = FloatArray(6)
+    private val targets = FloatArray(6)
+    private val shoulderFromEyes = FloatArray(3)
+    private val sureFor = FloatArray(2)
     private val palmSpeed = FloatArray(6)
     private val lastFree = FloatArray(6)
     private val speedKnown = booleanArrayOf(false, false)
@@ -512,7 +535,7 @@ class Coliseum {
         blows = 0; dummiesDown = 0; blowStrength = 0f
         for (i in 0..1) {
             openFor[i] = 0f; closedFor[i] = 0f; gripped[i] = false; letGo[i] = null
-            grabLock[i] = 0f; handPresent[i] = false; speedKnown[i] = false; armStretch[i] = 1f
+            grabLock[i] = 0f; handPresent[i] = false; speedKnown[i] = false; armStretch[i] = 1f; sureFor[i] = 0f
         }
     }
 
@@ -525,16 +548,32 @@ class Coliseum {
         world.clearDummies()
         for (d in dummies) if (d.up && d.standing > .5f) world.addDummy(d.x, d.z, Dummy.HEIGHT * d.standing)
 
+        var interval = 0f
         for (i in 0..1) {
             handPresent[i] = hands[i].present
             handLive[i] = hands[i].present && hands[i].live
+            // Sure enough to take things: followed, and for a moment already.
+            sureFor[i] = if (handLive[i] && hands[i].confidence >= TAKE_CONFIDENCE) sureFor[i] + dt else 0f
             if (!handPresent[i]) continue
             palmOf(hands[i].joints)
             offsets[i * 3] = c.worldX(local[0], local[1], local[2]) * reach
             offsets[i * 3 + 1] = c.worldY(local[0], local[1], local[2]) * reach
             offsets[i * 3 + 2] = c.worldZ(local[0], local[1], local[2]) * reach
+            val t = hands[i].target
+            if (hands[i].aimed) {
+                targets[i * 3] = c.worldX(t[0], t[1], t[2]) * reach; targets[i * 3 + 1] = c.worldY(t[0], t[1], t[2]) * reach
+                targets[i * 3 + 2] = c.worldZ(t[0], t[1], t[2]) * reach
+            } else { targets[i * 3] = offsets[i * 3]; targets[i * 3 + 1] = offsets[i * 3 + 1]; targets[i * 3 + 2] = offsets[i * 3 + 2] }
+            // The distance of a hand is only estimated from its size in the picture, and when
+            // that is wrong the hand would be metres away. An arm has a length: the hand is
+            // never further from its shoulder than that.
+            ArmPose.shoulder(0f, 0f, 0f, yaw, if (i == 0) -1f else 1f, shoulderFromEyes, 0)
+            armUsed[i] = withinArm(offsets, i * 3)
+            withinArm(targets, i * 3)
+            if (handLive[i] && hands[i].interval > interval) interval = hands[i].interval
         }
-        body.update(dt, world, handPresent, handLive, offsets)
+        body.readingInterval = interval
+        body.update(dt, world, handPresent, handLive, offsets, targets)
         c.place(body.x, body.y, body.z, yaw, pitch, roll)
 
         for (i in 0..1) {
@@ -635,28 +674,58 @@ class Coliseum {
     }
 
     /**
-     * The free weapon whose grip the hand is at. Depth is the weakest part of tracking with one
-     * camera, so the test is narrow across the line of sight and generous along it.
+     * The free weapon whose grip the hand is at: the palm, where it is in the arena, lies on the
+     * grip. The hand cannot be further away than the arm is long (see [withinArm]), so neither can
+     * the weapon. A weapon that only lines up with the hand as seen from the eyes is not taken.
      */
     private fun weaponInReach(hand: Int): Weapon? {
+        // Only a hand that is followed, and has been for a moment: not one that has just turned
+        // up, not a pose that is only being held.
+        if (sureFor[hand] < TAKE_AFTER) return null
         val hx = palm[hand * 3]; val hy = palm[hand * 3 + 1]; val hz = palm[hand * 3 + 2]
-        var dx = hx - body.x; var dy = hy - body.y; var dz = hz - body.z
-        val handDistance = sqrt(dx * dx + dy * dy + dz * dz)
-        if (handDistance < 1e-4f) return null
-        dx /= handDistance; dy /= handDistance; dz /= handDistance
         var best: Weapon? = null
-        var bestOff = GRAB_REACH
+        var bestOff = GRAB_REACH * reach / ARM_SCALE
         for (w in weapons) {
             if (w.held) continue
             // Nearest point of the grip, which runs a little way along the weapon on both sides.
             val t = ((hx - w.x) * w.ax + (hy - w.y) * w.ay + (hz - w.z) * w.az).coerceIn(-GRIP_BACK, GRIP_FRONT)
-            val gx = w.x + w.ax * t - hx; val gy = w.y + w.ay * t - hy; val gz = w.z + w.az * t - hz
-            val along = gx * dx + gy * dy + gz * dz
-            val px = gx - dx * along; val py = gy - dy * along; val pz = gz - dz * along
-            val off = sqrt(px * px + py * py + pz * pz + along * along * GRAB_ALONG * GRAB_ALONG)
-            if (off < bestOff) { bestOff = off; best = w }
+            val gx = w.x + w.ax * t; val gy = w.y + w.ay * t; val gz = w.z + w.az * t
+            // The real distance in the world from the palm to the grip, the same in every direction.
+            val off = sqrt((gx - hx) * (gx - hx) + (gy - hy) * (gy - hy) + (gz - hz) * (gz - hz))
+            if (off >= bestOff) continue
+            // Nothing solid between the eyes and the grip: no taking through a wall or a dummy.
+            if (!clearWay(body.x, body.y, body.z, gx, gy, gz)) continue
+            bestOff = off; best = w
         }
         return best
+    }
+
+    /** True when nothing solid lies on the straight line from a to b. */
+    fun clearWay(ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float): Boolean {
+        val dx = bx - ax; val dy = by - ay; val dz = bz - az
+        val length = sqrt(dx * dx + dy * dy + dz * dz)
+        val count = max(1, (length / WAY_STEP).toInt())
+        // The last piece is left out: the thing reached for may itself stand in the ground.
+        for (k in 1 until count) {
+            val t = k.toFloat() / count
+            if (world.distance(ax + dx * t, ay + dy * t, az + dz * t) < -WAY_DEPTH) return false
+        }
+        return true
+    }
+
+    /**
+     * Brings the place of a hand, given from the eyes at [values] `[o..o+2]`, back to within the
+     * length of the arm from its shoulder ([shoulderFromEyes]). Returns how much of the length of
+     * the arm the hand asked for.
+     */
+    private fun withinArm(values: FloatArray, o: Int): Float {
+        val dx = values[o] - shoulderFromEyes[0]; val dy = values[o + 1] - shoulderFromEyes[1]; val dz = values[o + 2] - shoulderFromEyes[2]
+        val d = sqrt(dx * dx + dy * dy + dz * dz)
+        val most = armLength
+        if (d <= most) return d / most
+        val f = most / d
+        values[o] = shoulderFromEyes[0] + dx * f; values[o + 1] = shoulderFromEyes[1] + dy * f; values[o + 2] = shoulderFromEyes[2] + dz * f
+        return d / most
     }
 
     /** Moves a held weapon to the hand and turns it along the knuckles. */
@@ -830,9 +899,16 @@ class Coliseum {
         const val LEAVE_DISTANCE = .45f
         const val AWAY_SECONDS = 4f
         private const val GRAB_LOCK = .4f
-        /** How near the grip the palm has to be, with distance along the line of sight counting for [GRAB_ALONG]. */
-        private const val GRAB_REACH = .34f
-        private const val GRAB_ALONG = .6f
+        /**
+         * How near the grip the middle of the palm has to be, in metres of the arena, when the
+         * hands reach [ARM_SCALE] times as far as the real ones: the palm (9 cm) lies on the grip.
+         */
+        const val GRAB_REACH = .20f
+        /** A hand takes things when its tracking is at least this sure, and has been for [TAKE_AFTER] seconds. */
+        const val TAKE_CONFIDENCE = .6f
+        const val TAKE_AFTER = .12f
+        private const val WAY_STEP = .10f
+        private const val WAY_DEPTH = .03f
         private const val GRIP_BACK = .15f
         private const val GRIP_FRONT = .20f
         private const val HIT_RADIUS = Dummy.RADIUS + .08f

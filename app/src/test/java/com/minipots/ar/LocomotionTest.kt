@@ -468,6 +468,191 @@ class LocomotionTest {
         assertTrue("head at ${g.body.z}", g.body.z >= -(Arena.RADIUS - GorillaBody.HEAD_RADIUS) - .01f)
     }
 
+    // ------------------------------------------------------------ hands the player cannot feel the floor with
+
+    @Test fun handFirstSeenDeepInTheGroundHoldsAndWalksWithoutThrowingTheBodyUp() {
+        for (deep in floatArrayOf(.2f, .5f, .9f)) {
+            val g = game()
+            // The hands are found when they are already well below the sand: the player felt no
+            // floor, or the camera takes a small hand for a distant one.
+            place(g, 0, -.25f, ground(g) - deep, -.8f); place(g, 1, .25f, ground(g) - deep, -.8f)
+            g.frames(3)
+            assertTrue("deep $deep: holds", g.body.touching[0] && g.body.touching[1])
+            assertEquals("deep $deep: not thrown up", g.eyeHeight, g.body.y, .01f)
+            // They are drawn on the sand, not under it.
+            assertEquals(g.body.handRadius, g.palm[1], .01f); assertEquals(g.body.handRadius, g.palm[4], .01f)
+            // Pulled back 60 cm down there: the body goes 60 cm forward.
+            g.move(.4f, 0f, ground(g) - deep, -.8f, 0f, ground(g) - deep, -.2f)
+            assertEquals("deep $deep", Arena.START_Z - .6f, g.body.z, .08f)
+            // (An arm at its full length swings on its shoulder, so the body may rise a little.)
+            assertEquals("deep $deep", g.eyeHeight, g.body.y, .06f)
+            // Lifted out of the ground, they let go.
+            g.move(.3f, 0f, ground(g) - deep, -.2f, 0f, -.2f, -.2f)
+            assertFalse(g.body.touching[0] || g.body.touching[1])
+            assertTrue(g.body.z < Arena.START_Z - .55f)
+        }
+    }
+
+    @Test fun handWhoseNewestReadingIsOffTheGroundHasLetGoAlready() {
+        val g = game()
+        g.move(.2f, 0f, -.4f, -.3f, 0f, ground(g) - .3f, -.3f)
+        assertTrue(g.body.touching[0] && g.body.touching[1])
+        val z = g.body.z; val y = g.body.y
+        // The next reading has the hands up and 60 cm further forward; the drawn hands only close
+        // in on it, and are still under the sand for the first frames of the way.
+        for (f in 1..6) {
+            val t = 1f - Math.pow(.5, f.toDouble()).toFloat()
+            for (i in 0..1) {
+                val side = if (i == 0) -.25f else .25f
+                place(g, i, side, ground(g) - .3f + .75f * t, -.3f - .6f * t)
+                hands[i].aimed = true
+                hands[i].target[0] = side / g.reach; hands[i].target[1] = (ground(g) + .45f) / g.reach; hands[i].target[2] = -.9f / g.reach
+            }
+            g.frames(1)
+            assertFalse("frame $f", g.body.touching[0] || g.body.touching[1])
+        }
+        hands[0].aimed = false; hands[1].aimed = false
+        // The way out did not drag the body back, nor down.
+        assertTrue("went back from $z to ${g.body.z}", g.body.z <= z + .02f)
+        assertTrue(g.body.y >= y - .05f)
+    }
+
+    // ------------------------------------------------------------ arms have a length
+
+    @Test fun handIsNeverFurtherFromItsShoulderThanTheArmIsLong() {
+        val g = game()
+        assertEquals(1.6f, g.armLength, 1e-5f)
+        // The camera takes the hands for 3 m, 6 m and 12 m away, in all sorts of directions.
+        val asks = floatArrayOf(0f, 0f, -3f, 2f, .5f, -6f, -4f, -1f, -2f, 0f, -8f, -9f, 1f, 5f, -1f)
+        for (n in 0 until asks.size / 3) {
+            place(g, 0, asks[n * 3] - .2f, asks[n * 3 + 1], asks[n * 3 + 2]); place(g, 1, asks[n * 3] + .2f, asks[n * 3 + 1], asks[n * 3 + 2])
+            g.body.reset(0f, 3f, 0f)
+            g.frames(1)
+            for (i in 0..1) {
+                val dx = g.palm[i * 3] - g.shoulder[i * 3]; val dy = g.palm[i * 3 + 1] - g.shoulder[i * 3 + 1]; val dz = g.palm[i * 3 + 2] - g.shoulder[i * 3 + 2]
+                assertTrue("ask $n hand $i: ${sqrt(dx * dx + dy * dy + dz * dz)}", sqrt(dx * dx + dy * dy + dz * dz) <= g.armLength + .02f)
+                assertTrue(g.armUsed[i] > 1f)
+                // Still in the direction it was seen in, from the shoulder.
+                val ax = asks[n * 3] + (if (i == 0) -.2f else .2f) - (g.shoulder[i * 3] - g.body.x)
+                val ay = asks[n * 3 + 1] - (g.shoulder[i * 3 + 1] - g.body.y); val az = asks[n * 3 + 2] - (g.shoulder[i * 3 + 2] - g.body.z)
+                val al = sqrt(ax * ax + ay * ay + az * az); val l = sqrt(dx * dx + dy * dy + dz * dz)
+                assertEquals(1f, (ax * dx + ay * dy + az * dz) / (al * l), 1e-3f)
+                // And the arm that is drawn is not stretched to speak of.
+                assertTrue("stretch ${g.armStretch[i]}", g.armStretch[i] < 1.12f)
+            }
+        }
+        // Within reach nothing is changed.
+        val h = game()
+        place(h, 1, .3f, -.2f, -.9f); h.frames(1)
+        assertEquals(.3f, h.palm[3] - h.body.x, 1e-4f); assertEquals(-.2f, h.palm[4] - h.body.y, 1e-4f); assertEquals(-.9f, h.palm[5] - h.body.z, 1e-4f)
+        assertTrue(h.armUsed[1] < 1f)
+        // A shorter reach makes shorter arms.
+        h.reach = 1.5f
+        assertEquals(1.6f * 1.5f / 2.5f, h.armLength, 1e-5f)
+    }
+
+    // ------------------------------------------------------------ taking things
+
+    /** The sword stands 2 m in front of the start, its grip 98 cm above the sand. */
+    private fun sword(g: Coliseum) = g.weapons[0]
+
+    @Test fun weaponOutOfReachIsNotTakenHoweverTheHandLinesUpWithIt() {
+        val g = game()
+        val w = sword(g)
+        val gx = w.x - g.body.x; val gy = w.y - g.body.y; val gz = w.z - g.body.z
+        // The hand is on the line from the eyes to the grip, at every distance the camera could
+        // take it for: half way, on the grip itself, and beyond it.
+        for (part in floatArrayOf(.3f, .5f, .7f, 1f, 1.5f, 3f)) {
+            place(g, 1, gx * part, gy * part, gz * part)
+            g.frames(30)
+            assertTrue("part $part", g.held[1] == null && !w.held)
+            // The hand stopped where the arm ends, 40 cm or more short of the grip.
+            val dx = g.palm[3] - w.x; val dy = g.palm[4] - w.y; val dz = g.palm[5] - w.z
+            assertTrue("part $part: ${sqrt(dx * dx + dy * dy + dz * dz)} from the grip", sqrt(dx * dx + dy * dy + dz * dz) > .35f)
+        }
+    }
+
+    @Test fun weaponIsTakenWhenThePalmIsOnItsGripAndOnlyThen() {
+        val g = game()
+        val w = sword(g)
+        // One metre from the sword: the grip is within reach of the arm.
+        g.body.reset(0f, g.eyeHeight, w.z + 1f)
+        val gy = w.y - g.body.y
+        // 30 cm beside the grip, 30 cm short of it, 30 cm past it, 30 cm above it: nothing.
+        val near = floatArrayOf(.3f, 0f, 0f, 0f, 0f, .3f, 0f, 0f, -.3f, 0f, .3f, 0f)
+        for (n in 0 until near.size / 3) {
+            place(g, 1, near[n * 3], gy + near[n * 3 + 1] + .1f, -1f + near[n * 3 + 2])
+            g.frames(30)
+            assertTrue("miss $n", g.held[1] == null)
+        }
+        // The palm on the grip, 10 cm off: taken, after the moment it takes to be sure of a
+        // hand that has just come into view.
+        hide(1); g.frames(2)
+        place(g, 1, .08f, gy + .05f, -1f + .05f)
+        g.frames(2)
+        assertTrue("not at once", g.held[1] == null)
+        g.frames(12)
+        assertTrue(g.held[1] === w && w.held)
+    }
+
+    @Test fun handThatIsNotSureTakesNothing() {
+        for (case in 0..2) {
+            val g = game()
+            val w = sword(g)
+            g.body.reset(0f, g.eyeHeight, w.z + 1f)
+            place(g, 1, 0f, w.y - g.body.y, -1f)
+            when (case) {
+                // Only the last pose, held.
+                0 -> hands[1].live = false
+                // Only just found, or found again somewhere else: one reading.
+                1 -> hands[1].confidence = .5f
+                // Fading out.
+                else -> hands[1].confidence = .3f
+            }
+            g.frames(60)
+            assertTrue("case $case", g.held[1] == null && !w.held)
+            // Once it is sure, it takes.
+            hands[1].live = true; hands[1].confidence = 1f
+            g.frames(12)
+            assertTrue("case $case", g.held[1] === w)
+            hands[1].confidence = 1f
+        }
+    }
+
+    @Test fun nothingIsTakenThroughADummyOrAWall() {
+        // A sword that lies behind a dummy, the palm reaching round to it.
+        val g = game()
+        val w = sword(g); val d = g.dummies[0]
+        g.body.reset(d.x, g.eyeHeight, d.z + 1.05f)
+        w.plant(d.x, d.z - Dummy.RADIUS - .12f)
+        g.frames(2)
+        // The grip is 1.3 m from the eyes, straight behind the dummy.
+        assertFalse(g.clearWay(g.body.x, g.body.y, g.body.z, w.x, w.y, w.z))
+        place(g, 1, 0f, w.y - g.body.y, w.z - g.body.z)
+        g.frames(40)
+        assertTrue(g.held[1] == null && !w.held)
+        // The same sword with the dummy out of the way is taken.
+        g.body.reset(d.x + 1.2f, g.eyeHeight, w.z + .6f)
+        assertTrue(g.clearWay(g.body.x, g.body.y, g.body.z, w.x, w.y, w.z))
+        hide(1); g.frames(2)
+        place(g, 1, w.x - g.body.x, w.y - g.body.y, w.z - g.body.z)
+        g.frames(20)
+        assertTrue(g.held[1] === w)
+
+        // A mace thrown on to the first row of seats, behind the wall, and the player down in the arena.
+        val h = game()
+        val m = h.weapons[2]
+        m.plant(0f, -(Arena.RADIUS + .5f)); m.y = Arena.WALL_HEIGHT + m.plantedHeight
+        h.body.reset(0f, h.eyeHeight, -(Arena.RADIUS - .6f))
+        h.frames(1)
+        assertFalse(h.clearWay(h.body.x, h.body.y, h.body.z, m.x, m.y - .5f, m.z))
+        // The hand is asked to be in the wall and up it: it is drawn on the wall and takes nothing.
+        place(h, 1, 0f, 1.2f, -1.0f)
+        h.frames(40)
+        assertTrue(h.held[1] == null)
+        assertTrue("hand at ${h.palm[5]}", h.palm[5] >= -Arena.RADIUS)
+    }
+
     // ------------------------------------------------------------ the size of the body
 
     @Test fun heightOfTheEyesCanBeSetAndTheBodyStandsAtIt() {

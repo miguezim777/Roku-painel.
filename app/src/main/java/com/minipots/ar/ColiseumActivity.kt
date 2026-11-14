@@ -15,12 +15,15 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
 import android.opengl.GLSurfaceView
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
+import android.annotation.SuppressLint
+import android.util.Range
 import android.util.Size
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -35,6 +38,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -47,6 +51,7 @@ import androidx.core.view.WindowInsetsCompat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -81,6 +86,13 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     private val measurements = ArrayDeque<String>()
     private var heat = ""
     private var heatAtMs = 0L
+    private var thermalStatus = 0
+    // The picture is drawn this many pixels across at most; lowered when drawing cannot keep up.
+    private var renderWidth = MAX_RENDER_WIDTH
+    private var slowSeconds = 0
+    private var cooledDown = false
+    private var oneHand = false
+    private lateinit var handsButton: Button
     private var ipdMm = 63
     private var lensMm = 42
     private var quarterTurns = 1
@@ -130,6 +142,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         ipdMm = settings.getInt(KEY_IPD, 63).coerceIn(MIN_IPD_MM, MAX_IPD_MM)
         lensMm = settings.getInt(KEY_LENS, 42).coerceIn(MIN_LENS_MM, MAX_LENS_MM)
         fluid = settings.getBoolean(KEY_FLUID, false)
+        oneHand = settings.getBoolean(KEY_ONE_HAND, false)
         eyeCm = settings.getInt(KEY_EYE_CM, DEFAULT_EYE_CM).coerceIn(MIN_EYE_CM, MAX_EYE_CM)
         reachTenths = settings.getInt(KEY_REACH, DEFAULT_REACH_TENTHS).coerceIn(MIN_REACH_TENTHS, MAX_REACH_TENTHS)
         findLookModes()
@@ -139,6 +152,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         tracker = HandTracker(this, this, hands = 2, modelAsset = HandTracker.LIGHT_MODEL_ASSET)
         // The picture is not shown; this only matters to the single-hand readings, unused here.
         tracker.viewAspect = 4f / 3f
+        tracker.oneHandOnly = oneHand
         processorSetting = ProcessorSetting(this, tracker) { message -> renderer.showNotice(message) }
         renderer = ColiseumRenderer(tracker, sensorLook, this, chooseProcessor = processorSetting.automatic)
         renderer.lookMode = lookMode
@@ -216,6 +230,16 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         button("Mãos +") { reachTenths = (reachTenths + 1).coerceAtMost(MAX_REACH_TENTHS); saveBody() }
         button("Recomeçar") { surface.queueEvent { renderer.restart() } }
         button("Câmera ⟲") { frontCamera = !frontCamera; bindCamera() }
+        handsButton = button(handsLabel()) {
+            oneHand = !oneHand
+            settings.edit().putBoolean(KEY_ONE_HAND, oneHand).apply()
+            tracker.oneHandOnly = oneHand
+            handsButton.text = handsLabel()
+            renderer.showNotice(
+                if (oneHand) "Uma mão só: o rastreamento não procura mais a segunda mão e fica mais rápido. Dá para andar e lutar com uma mão."
+                else "Duas mãos: quando só uma aparece, a outra é procurada de vez em quando, o que custa tempo."
+            )
+        }
         button("CPU ⇄ GPU") { surface.queueEvent { renderer.stopChoosingProcessor() }; processorSetting.switchByHand() }
         button("Copiar medições") { copyMeasurements() }
         button("Potinhos") { openPots() }
@@ -238,9 +262,41 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     // ---------------------------------------------------------------- ColiseumRenderer.Callbacks (GL thread)
 
     override fun status(text: String) { runOnUiThread { showStatus(text) } }
+    private fun handsLabel() = if (oneHand) "Mãos: uma (rápido)" else "Mãos: duas"
+
+    /**
+     * Drawing that cannot keep up, or a phone that the system is holding back because of heat,
+     * gets fewer pixels to fill: the picture is drawn smaller and stretched to the screen. Only
+     * ever downwards, and no further than [MIN_RENDER_WIDTH]; a slow tracker does not slow the
+     * drawing down, so this does not react to it.
+     */
+    override fun frameRate(fps: Int) {
+        runOnUiThread {
+            if (isDestroyed || isFinishing) return@runOnUiThread
+            slowSeconds = if (fps in 1 until SLOW_FPS) slowSeconds + 1 else 0
+            val hot = thermalStatus >= HOT_STATUS && !cooledDown
+            if (slowSeconds < SLOW_SECONDS && !hot) return@runOnUiThread
+            if (hot) cooledDown = true
+            slowSeconds = 0
+            if (viewWidth <= 0) return@runOnUiThread
+            val now = min(renderWidth, viewWidth)
+            val next = max(MIN_RENDER_WIDTH, now - RENDER_STEP)
+            if (next >= now) return@runOnUiThread
+            renderWidth = next
+            applyRenderWidth()
+        }
+    }
+
+    private fun applyRenderWidth() {
+        if (viewWidth <= 0 || viewHeight <= 0) return
+        if (viewWidth > renderWidth) {
+            surface.holder.setFixedSize(renderWidth, (viewHeight.toFloat() * renderWidth / viewWidth).roundToInt())
+        } else surface.holder.setSizeFromLayout()
+    }
+
     override fun stats(text: String) {
         runOnUiThread {
-            val line = text + heatText()
+            val line = text + " · desenho ${min(renderWidth, if (viewWidth > 0) viewWidth else renderWidth)} px" + heatText()
             stats.text = line
             measurements.addLast(line)
             while (measurements.size > MAX_MEASUREMENTS) measurements.removeFirst()
@@ -265,6 +321,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
                 val status = (getSystemService(Context.POWER_SERVICE) as PowerManager).currentThermalStatus
+                thermalStatus = status
                 text += " · freio térmico $status"
             } catch (_: Exception) {}
         }
@@ -513,9 +570,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     private fun onSurfaceLayout(width: Int, height: Int) {
         if (width <= 0 || height <= 0 || (width == viewWidth && height == viewHeight)) return
         viewWidth = width; viewHeight = height
-        if (width > MAX_RENDER_WIDTH) {
-            surface.holder.setFixedSize(MAX_RENDER_WIDTH, (height.toFloat() * MAX_RENDER_WIDTH / width).roundToInt())
-        } else surface.holder.setSizeFromLayout()
+        applyRenderWidth()
         applyStereo()
         syncRotation()
     }
@@ -560,6 +615,39 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         return HandTracker.DEFAULT_FOCAL
     }
 
+    /**
+     * Asks the camera for a steady 30 pictures a second. Left to itself, a camera in a room that
+     * is not bright lets each picture take up to a tenth of a second to gather light: fewer
+     * pictures, and a moving hand is a smear in each of them, which is when the tracker loses it.
+     * With the rate fixed no picture can take longer than a thirtieth of a second; it comes out
+     * darker and grainier instead, which the tracker copes with better.
+     */
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun steadyFrameRate(builder: ImageAnalysis.Builder, front: Boolean) {
+        try {
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val facing = if (front) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+            for (id in manager.cameraIdList) {
+                val c = manager.getCameraCharacteristics(id)
+                if (c.get(CameraCharacteristics.LENS_FACING) != facing) continue
+                // The first camera on that side is the one CameraX opens.
+                val ranges = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: return
+                var best: Range<Int>? = null
+                for (r in ranges) {
+                    if (r.upper > 30) continue
+                    val b = best
+                    // The highest floor wins; between equal floors, the higher ceiling.
+                    if (b == null || r.lower > b.lower || (r.lower == b.lower && r.upper > b.upper)) best = r
+                }
+                val chosen = best ?: return
+                // Nothing to gain from a range that still allows slow pictures.
+                if (chosen.lower < 20) return
+                Camera2Interop.Extender(builder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, chosen)
+                return
+            }
+        } catch (_: Exception) {}
+    }
+
     /** The camera only feeds the hand tracker; its picture is not shown. */
     private fun bindCamera() {
         val provider = cameraProvider ?: return
@@ -572,7 +660,9 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
             if (!frontCamera && !back) frontCamera = true
             @Suppress("DEPRECATION")
             val rotation = windowManager.defaultDisplay.rotation
-            val analysis = ImageAnalysis.Builder()
+            val builder = ImageAnalysis.Builder()
+            steadyFrameRate(builder, frontCamera)
+            val analysis = builder
                 .setTargetRotation(rotation)
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
@@ -645,6 +735,17 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         const val KEY_IPD = "ipd_mm"
         const val KEY_LENS = "lens_mm"
         const val KEY_FLUID = "locomotion_fluid"
+        const val KEY_ONE_HAND = "one_hand"
+        /** The picture is never drawn narrower than this by itself, */
+        const val MIN_RENDER_WIDTH = 960
+        /** and gets this much narrower each time */
+        const val RENDER_STEP = 160
+        /** the screen has shown fewer than this many frames a second */
+        const val SLOW_FPS = 45
+        /** for this many seconds in a row, */
+        const val SLOW_SECONDS = 4
+        /** or, once, when the system reports this much heat (PowerManager.THERMAL_STATUS_SEVERE). */
+        const val HOT_STATUS = 3
         const val KEY_EYE_CM = "eye_cm"
         const val KEY_REACH = "reach_tenths"
         const val DEFAULT_EYE_CM = 80

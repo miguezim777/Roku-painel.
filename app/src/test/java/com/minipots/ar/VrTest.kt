@@ -349,7 +349,7 @@ class VrTest {
         assertEquals(HandRig.State.HELD, rig.state)
         assertTrue(rig.confidence < early)
         // After that it is lost, and says so.
-        now = follow(rig, now, .3f, 1f) { null }
+        now = follow(rig, now, HandRig.HOLD_SECONDS - .6f, 1f) { null }
         assertEquals(HandRig.State.LOST, rig.state); assertEquals(0f, rig.confidence, 0f)
         now = follow(rig, now, 1f, 1f) { null }
         assertEquals(HandRig.State.LOST, rig.state)
@@ -372,7 +372,7 @@ class VrTest {
             if (t > .6f) assertEquals("at $t s", HandRig.State.TRACKED, rig.state)
             now += (dt * 1e9f).toLong(); t += dt
         }
-        // Readings stop. A fast phone gives the hand up after 0.9 s; this one has to wait longer
+        // Readings stop. A fast phone gives the hand up after 1.5 s; this one has to wait longer
         // to know, so the hand is kept longer, and then it is lost all the same.
         now = follow(rig, now, HandRig.HOLD_SECONDS + .2f, 9f) { null }
         assertEquals(HandRig.State.HELD, rig.state)
