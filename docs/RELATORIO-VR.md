@@ -76,8 +76,8 @@ Chegaram 28 segundos de medições de um Xiaomi 25062RN2DL (Android 16), os prim
 |---|---|---|
 | Olhar | bússola | o aparelho **não tem giroscópio** |
 | tela | 60 qps, 0 a 2 quadros lentos por segundo | o desenho não é o gargalo; o tempo de 14,8 ms inclui a espera pela tela (no primeiro segundo, a 108 qps, eram 6,5 ms) |
-| rastreio sem mão | 9 a 12 por segundo | cada procura por mãos leva perto de 90 ms |
-| atraso | 161 a 184 ms | idade da foto (uns 80 ms) mais o custo da procura |
+| rastreio sem mão | 9 a 12 por segundo | ou cada procura por mãos leva perto de 90 ms (o mais provável num aparelho desta classe), ou a câmera só faz umas 11 fotos por segundo; estas medições não separam as duas coisas, as novas separam |
+| atraso | 161 a 184 ms | idade da foto mais o custo da procura |
 | freio térmico | 0, bateria a 36 °C | o aparelho não estava quente |
 
 O que **não** dá para saber por eles: quantas leituras por segundo há com uma mão seguida, se a câmera faz 30 fotos por segundo ou menos (o número `câmera` media as fotos que chegavam ao rastreador, não as que a câmera fazia), e se o jogo acha as mãos neste aparelho.
@@ -85,7 +85,7 @@ O que **não** dá para saber por eles: quantas leituras por segundo há com uma
 ### O que mudou por causa disso
 
 - **Vista atrasada sem giroscópio.** No modo bússola a vista passava por um alisamento fixo de 0,25 s: a imagem chegava um quarto de segundo depois da cabeça em todo giro. Isso é do código, não uma suposição. Agora (`HeadFilter`) o alisamento é o mesmo com a cabeça parada e cede quando ela gira. Simulado, com leituras que tremem 1,5°: a vista fica uns 3° atrás da cabeça entre 30 e 90° por segundo (antes 7,5° a 22,5°), e treme o mesmo com a cabeça parada (0,33° contra 0,30°). **Risco que não sei medir daqui:** ao puxar o chão, o corpo balança, o acelerômetro sente, e a vista pode balançar mais do que antes. Por isso há o botão **Bússola: rápida / suave**; "suave" é o comportamento antigo. Se o sensor do aparelho tremer 3° em vez de 1,5°, a vista parada treme mais (1,0° contra 0,6° na simulação).
-- **A procura da segunda mão não interrompe um movimento.** Com uma mão seguida e **Mãos: duas**, a outra era procurada a cada 0,35 s, e cada procura custa várias leituras da mão seguida — neste aparelho, pelo custo medido da busca, algo como 0,1 s parado a cada 0,35 s. Uma mão rápida é a que se perde numa pausa dessas. Agora, enquanto a mão cruza a imagem a mais de 0,8 largura por segundo, a procura espera até 1 s. O custo: a segunda mão pode demorar até 1 s para aparecer se a primeira estiver em movimento.
+- **A procura da segunda mão não interrompe um movimento.** Com uma mão seguida e **Mãos: duas**, a outra era procurada a cada 0,35 s, e cada procura custa várias leituras da mão seguida — neste aparelho, se a busca custa mesmo uns 90 ms, algo como 0,1 s parado a cada 0,35 s. Uma mão rápida é a que se perde numa pausa dessas. Agora, enquanto a mão cruza a imagem a mais de 0,8 largura por segundo, a procura espera até 1 s. O custo: a segunda mão pode demorar até 1 s para aparecer se a primeira estiver em movimento.
 - **Medições que sobrevivem ao corte.** **Copiar medições** começa por um resumo da sessão (tempo com mãos na tela, quantas vezes sumiram, quanto cada mão tocou o chão e a que distância chegou, metros andados, armas pegas, custo por foto com mão e por busca) e lista os segundos do mais novo para o mais antigo, cada um com o instante.
 - **Números da câmera medidos onde acontecem.** `câmera` agora conta as fotos que a câmera faz; há também `exposição`, `luz` (claridade da imagem), `busca` (custo da procura) e `sensor do olhar`.
 - **Imagem escura.** O pedido de 30 fotos fixas da rodada anterior pode deixar a imagem escura demais onde há pouca luz, e aí nenhuma mão é achada. Se a imagem ficar abaixo de 12% de claridade por 4 s, a câmera volta ao ritmo livre e o jogo avisa.
