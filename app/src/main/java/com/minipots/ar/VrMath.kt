@@ -330,7 +330,10 @@ class HandRig {
         private set
     var palmSign = 1f
         private set
-    /** 21 points in camera space, metres. Only meaningful unless [state] is [State.LOST]. */
+    /**
+     * 21 points in metres, along the axes of the camera, or along steady axes when the readings
+     * come with the turn of the head (see [accept]). Only meaningful unless [state] is [State.LOST].
+     */
     val joints = FloatArray(HAND_POINTS * 3)
     /** Speed of the hand in camera space, metres per second. */
     val velocity = FloatArray(3)
@@ -344,6 +347,9 @@ class HandRig {
     private val raw = FloatArray(HAND_POINTS * 3)
     private val shape = FloatArray(HAND_POINTS * 3)
     private val scratch = FloatArray(HAND_POINTS * 3)
+    /** [shape] along the steady axes, when a reading came with the turn of the head. */
+    private val turned = FloatArray(HAND_POINTS * 3)
+    private var steady = false
     private val lengths = FloatArray(HandGeometry.BONE_COUNT)
     private var size = 0f
     private val tanFilters = Array(2) { OneEuroFilter(1.2f, 12f, 2f) }
@@ -367,13 +373,25 @@ class HandRig {
         fist.reset(); velocity.fill(0f)
     }
 
-    /** A reading of this hand taken at [timeNs]. Readings without the hand are simply not passed. */
-    fun accept(r: HandReading, timeNs: Long, aspect: Float, focal: Float) {
+    /**
+     * A reading of this hand taken at [timeNs]. Readings without the hand are simply not passed.
+     *
+     * [turn] is how the head was turned when the picture was taken (nine numbers, as
+     * [Look.cameraToWorld] gives them), or null. With it, [joints] and [velocity] are no longer
+     * along the axes of the camera but along axes that stay still when the head turns: a reading
+     * is always some time old, and a head that has turned since must not carry the hand with it.
+     */
+    fun accept(r: HandReading, timeNs: Long, aspect: Float, focal: Float, turn: FloatArray? = null) {
         if (!r.present) return
         val depth = HandGeometry.depth(r, aspect, focal)
         if (depth <= 0f) return
         val tanX = HandGeometry.palmTanX(r, focal); val tanY = HandGeometry.palmTanY(r, aspect, focal)
-        val x = tanX * depth; val y = tanY * depth; val z = -depth
+        var x = tanX * depth; var y = tanY * depth; var z = -depth
+        if (turn != null) {
+            val cx = x; val cy = y; val cz = z
+            x = turn[0] * cx + turn[1] * cy + turn[2] * cz; y = turn[3] * cx + turn[4] * cy + turn[5] * cz
+            z = turn[6] * cx + turn[7] * cy + turn[8] * cz
+        }
 
         var dt = 0f
         if (following) {
@@ -407,7 +425,12 @@ class HandRig {
         val fx = tanFilters[0].filter(tanX, dt, tanScale)
         val fy = tanFilters[1].filter(tanY, dt, tanScale)
         val fd = depthFilter.filter(depth, dt, DEPTH_SPEED_SCALE)
-        val nx = fx * fd; val ny = fy * fd; val nz = -fd
+        var nx = fx * fd; var ny = fy * fd; var nz = -fd
+        if (turn != null) {
+            val cx = nx; val cy = ny; val cz = nz
+            nx = turn[0] * cx + turn[1] * cy + turn[2] * cz; ny = turn[3] * cx + turn[4] * cy + turn[5] * cz
+            nz = turn[6] * cx + turn[7] * cy + turn[8] * cz
+        }
         if (following && dt > 0f) {
             // Mostly the newest speed: in a simulated swing, an older one sends the hand on the
             // wrong way at each turn.
@@ -426,6 +449,15 @@ class HandRig {
         for (i in HandGeometry.PALM) { mx += shape[i * 3]; my += shape[i * 3 + 1]; mz += shape[i * 3 + 2] }
         mx /= HandGeometry.PALM.size; my /= HandGeometry.PALM.size; mz /= HandGeometry.PALM.size
         for (i in 0 until HAND_POINTS) { shape[i * 3] -= mx; shape[i * 3 + 1] -= my; shape[i * 3 + 2] -= mz }
+        if (turn != null) {
+            for (i in 0 until HAND_POINTS) {
+                val cx = shape[i * 3]; val cy = shape[i * 3 + 1]; val cz = shape[i * 3 + 2]
+                turned[i * 3] = turn[0] * cx + turn[1] * cy + turn[2] * cz
+                turned[i * 3 + 1] = turn[3] * cx + turn[4] * cy + turn[5] * cz
+                turned[i * 3 + 2] = turn[6] * cx + turn[7] * cy + turn[8] * cz
+            }
+        }
+        steady = turn != null
 
         closed = fist.update(HandShape.closedRatio(r.world))
         palmSign = r.palmSign
@@ -468,10 +500,11 @@ class HandRig {
         val px = centreX + velocity[0] * lead; val py = centreY + velocity[1] * lead; val pz = centreZ + velocity[2] * lead
         // A new reading never makes the drawn hand jump: it closes in over a few frames.
         val k = if (!shown || dt <= 0f) 1f else 1f - exp(-dt / GLIDE_SECONDS)
+        val form = if (steady) turned else shape
         for (i in 0 until HAND_POINTS) {
-            joints[i * 3] += (px + shape[i * 3] - joints[i * 3]) * k
-            joints[i * 3 + 1] += (py + shape[i * 3 + 1] - joints[i * 3 + 1]) * k
-            joints[i * 3 + 2] += (pz + shape[i * 3 + 2] - joints[i * 3 + 2]) * k
+            joints[i * 3] += (px + form[i * 3] - joints[i * 3]) * k
+            joints[i * 3 + 1] += (py + form[i * 3 + 1] - joints[i * 3 + 1]) * k
+            joints[i * 3 + 2] += (pz + form[i * 3 + 2] - joints[i * 3 + 2]) * k
         }
         shown = true
     }
@@ -562,6 +595,55 @@ class TrackerChoice {
     }
 }
 
+/**
+ * How the head was turned over the last second or so, so that a reading of a hand can be put
+ * where the head was when its picture was taken, not where the head is when the reading arrives.
+ */
+class LookHistory {
+    private val times = LongArray(SIZE)
+    private val yaws = FloatArray(SIZE)
+    private val pitches = FloatArray(SIZE)
+    private val rolls = FloatArray(SIZE)
+    private var count = 0
+    private var next = 0
+
+    fun clear() { count = 0; next = 0 }
+
+    fun add(timeNs: Long, yaw: Float, pitch: Float, roll: Float) {
+        times[next] = timeNs; yaws[next] = yaw; pitches[next] = pitch; rolls[next] = roll
+        next = (next + 1) % SIZE
+        if (count < SIZE) count++
+    }
+
+    /**
+     * Yaw, pitch and roll at [timeNs] into [out]`[0..2]`: between the two entries around that
+     * time, or the oldest or newest one beyond them. False when nothing is known yet.
+     */
+    fun at(timeNs: Long, out: FloatArray): Boolean {
+        if (count == 0) return false
+        // From the newest entry back to the first one that is not later than the time asked for.
+        var later = -1
+        for (n in 1..count) {
+            val i = (next - n + SIZE * 2) % SIZE
+            if (times[i] <= timeNs) {
+                if (later < 0 || times[later] <= times[i]) { out[0] = yaws[i]; out[1] = pitches[i]; out[2] = rolls[i]; return true }
+                val t = (timeNs - times[i]).toFloat() / (times[later] - times[i]).toFloat()
+                out[0] = yaws[i] + Look.angleDifference(yaws[later], yaws[i]) * t
+                out[1] = pitches[i] + (pitches[later] - pitches[i]) * t
+                out[2] = rolls[i] + Look.angleDifference(rolls[later], rolls[i]) * t
+                return true
+            }
+            later = i
+        }
+        out[0] = yaws[later]; out[1] = pitches[later]; out[2] = rolls[later]
+        return true
+    }
+
+    private companion object {
+        const val SIZE = 128
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The arms
 // ---------------------------------------------------------------------------------------------
@@ -594,10 +676,12 @@ object ArmPose {
     /**
      * The elbow of the arm from the shoulder at [shoulders] `[offset..offset+2]` to the wrist at
      * ([wx], [wy], [wz]), written to [out] at [offset]. It bends outwards, down and back, as a
-     * hanging arm does. Returns how many times longer than [BONE] each bone has to be: 1 while the
-     * hand is within reach.
+     * hanging arm does. Each bone is [length] long. Returns how many times longer than that each
+     * has to be: 1 while the hand is within reach.
      */
-    fun elbow(shoulders: FloatArray, offset: Int, wx: Float, wy: Float, wz: Float, yaw: Float, side: Float, out: FloatArray): Float {
+    fun elbow(
+        shoulders: FloatArray, offset: Int, wx: Float, wy: Float, wz: Float, yaw: Float, side: Float, out: FloatArray, length: Float = BONE,
+    ): Float {
         val sx = shoulders[offset]; val sy = shoulders[offset + 1]; val sz = shoulders[offset + 2]
         var dx = wx - sx; var dy = wy - sy; var dz = wz - sz
         val d = sqrt(dx * dx + dy * dy + dz * dz)
@@ -606,12 +690,12 @@ object ArmPose {
         var px = c * side * .7f - sn * .4f; var py = -.6f; var pz = sn * side * .7f + c * .4f
         if (d < 1e-4f) {
             val l = sqrt(px * px + py * py + pz * pz)
-            out[offset] = sx + px / l * BONE; out[offset + 1] = sy + py / l * BONE; out[offset + 2] = sz + pz / l * BONE
+            out[offset] = sx + px / l * length; out[offset + 1] = sy + py / l * length; out[offset + 2] = sz + pz / l * length
             return 1f
         }
         dx /= d; dy /= d; dz /= d
-        val stretch = max(1f, d / (2f * BONE))
-        val bone = BONE * stretch
+        val stretch = max(1f, d / (2f * length))
+        val bone = length * stretch
         // Both bones are equally long: the elbow is over the middle, as far out as the bones allow.
         val height = sqrt(max(0f, bone * bone - d * d * .25f))
         val along = px * dx + py * dy + pz * dz
@@ -728,10 +812,24 @@ class ArenaWorld {
 // Moving with the hands
 // ---------------------------------------------------------------------------------------------
 
+/** How the hands move the body. */
+enum class Locomotion {
+    /** A hand has to touch something: it holds on there, and moving it moves the body the other way. */
+    CONTACT,
+    /** Nothing has to be touched: strokes of the hands below the eyes row the body along. */
+    FLUID,
+}
+
 /**
- * The body of the player, moved the way Gorilla Tag does it. There are no legs, no stick and no
- * teleport: the only thing that moves the body is a hand touching something.
+ * The body of the player. There are no legs, no stick and no teleport: the only thing that moves
+ * the body is what the hands do, and then gravity, friction and the things in its way.
  *
+ * Time goes in fixed steps of [STEP] seconds, however long a drawn frame takes: the frame time is
+ * collected and used up one step at a time, at most [MAX_STEPS] of them per frame. Within a frame
+ * each hand goes in a straight line from where it was to where it is, one piece per step, so a
+ * fast hand is tested all along its way and does not pass through a thing between two frames.
+ *
+ * [Locomotion.CONTACT], as in Gorilla Tag:
  *  - A hand that reaches a surface (sand, wall, seats, a dummy) is held there: its place in the
  *    world is fixed for as long as it stays in touch.
  *  - While a hand is held, moving the real hand moves the body the other way. Pulling the hand
@@ -739,7 +837,17 @@ class ArenaWorld {
  *  - With both hands in touch the body follows the mean of the two.
  *  - The speed the body has when the last hand lets go is kept, and from then on only gravity
  *    acts: a quick push is a jump, a quick pull along the ground a slide.
- *  - The body cannot enter anything solid.
+ *
+ * [Locomotion.FLUID], for when the depth of the hands is too unsure to find the ground with:
+ *  - A hand that moves while it is below the level of the eyes makes a stroke, as if it pulled on
+ *    a floor that is always within reach. The body speeds up the other way, never faster than the
+ *    hand goes and never by more than [FLUID_ACCELERATION] at a time.
+ *  - To bring the hand back without rowing back, it is lifted to the level of the eyes.
+ *  - A stroke straight down, by every hand that is followed, is a jump; the next one has to wait
+ *    [JUMP_INTERVAL] seconds.
+ *
+ * In both: a hand that is not `live` (its tracking is not fresh) moves nothing and holds nothing,
+ * a hand that moves faster than a hand can is ignored, and the body cannot enter anything solid.
  */
 class GorillaBody {
     /** Position of the eyes. */
@@ -747,11 +855,34 @@ class GorillaBody {
     var vx = 0f; var vy = 0f; var vz = 0f
     /** True while the hand is held on a surface. */
     val touching = booleanArrayOf(false, false)
+    /** True while the hand makes a stroke that rows the body ([Locomotion.FLUID]). */
+    val stroking = booleanArrayOf(false, false)
     /** Where each hand is drawn, x, y, z per hand: on the surface while held, else where the real hand is. */
     val hand = FloatArray(6)
     /** The body stands on a floor (and is not hanging from a hand above it). */
     var onGround = true
         private set
+    /** Steps of [STEP] seconds taken so far. */
+    var steps = 0L
+        private set
+    /** Movements of a hand that were too fast to be true, and were ignored. */
+    var rejected = 0
+        private set
+    var mode = Locomotion.CONTACT
+        set(value) {
+            if (field == value) return
+            field = value
+            // Nothing of the one way of moving is carried into the other.
+            release()
+        }
+    /** Height of the eyes above the floor at rest. The body is as big as this makes it. */
+    var eyeHeight = EYE_HEIGHT
+        set(value) { field = value.coerceIn(MIN_EYE_HEIGHT, MAX_EYE_HEIGHT) }
+    /** How many times further than the real hands the hands of the body reach. Speeds of a hand are judged by it. */
+    var reach = Coliseum.ARM_SCALE
+        set(value) { field = value.coerceIn(MIN_REACH, MAX_REACH) }
+    /** The palm touches as a ball of this radius. */
+    val handRadius: Float get() = HAND_RADIUS * reach / Coliseum.ARM_SCALE
 
     private val pin = FloatArray(6)
     private val historyX = FloatArray(HISTORY)
@@ -759,39 +890,119 @@ class GorillaBody {
     private val historyZ = FloatArray(HISTORY)
     private var historyCount = 0
     private var historyNext = 0
+    private var accumulator = 0f
+    /** Where each hand was at the end of the last frame that took a step. */
+    private val last = FloatArray(6)
+    private val hadLast = booleanArrayOf(false, false)
+    /** Where each hand is in the step being taken, and where it was one step before. */
+    private val at = FloatArray(6)
+    private val before = FloatArray(6)
+    private val hasBefore = booleanArrayOf(false, false)
+    private val usable = booleanArrayOf(false, false)
+    private val handSpeed = FloatArray(6)
+    /** The hand was seen clear of everything since it was last believed: it can arrive at a surface. */
+    private val free = booleanArrayOf(false, false)
+    /** The hand has been below the eyes without going down fast: a push down from here is a jump. */
+    private val ready = booleanArrayOf(false, false)
+    private var sinceJump = JUMP_INTERVAL
 
     fun reset(startX: Float, startY: Float, startZ: Float) {
         x = startX; y = startY; z = startZ
         vx = 0f; vy = 0f; vz = 0f
-        touching[0] = false; touching[1] = false; onGround = true
-        historyCount = 0; historyNext = 0
+        onGround = true; accumulator = 0f; sinceJump = JUMP_INTERVAL
+        hadLast[0] = false; hadLast[1] = false
+        release()
+    }
+
+    private fun release() {
+        for (i in 0..1) { touching[i] = false; stroking[i] = false; hasBefore[i] = false; free[i] = false; ready[i] = false }
+        handSpeed.fill(0f); historyCount = 0; historyNext = 0
     }
 
     /**
      * Advances by [dt] seconds. [offsets] holds, for each hand, where its palm is relative to the
-     * eyes in world axes (x, y, z per hand); a hand that is not [present] is ignored.
+     * eyes in world axes (x, y, z per hand). A hand that is not [present] is ignored; one that is
+     * present but not [live] is only drawn.
      */
-    fun update(dt: Float, world: ArenaWorld, present: BooleanArray, offsets: FloatArray) {
+    fun update(dt: Float, world: ArenaWorld, present: BooleanArray, live: BooleanArray, offsets: FloatArray) {
         if (dt <= 0f) return
+        // A frame that took very long is not made up for: the rest of its time is dropped.
+        accumulator = min(accumulator + dt, STEP * MAX_STEPS)
+        val count = ((accumulator + STEP * 1e-3f) / STEP).toInt()
+        for (k in 1..count) {
+            val t = k.toFloat() / count
+            for (i in 0..1) {
+                usable[i] = present[i] && live[i]
+                for (c in 0..2) {
+                    val now = offsets[i * 3 + c]
+                    at[i * 3 + c] = if (present[i] && hadLast[i]) last[i * 3 + c] + (now - last[i * 3 + c]) * t else now
+                }
+            }
+            if (mode == Locomotion.FLUID) stepFluid(world) else stepContact(world)
+            steps++
+        }
+        accumulator = max(0f, accumulator - count * STEP)
+        for (i in 0..1) {
+            if (!present[i]) { hadLast[i] = false; continue }
+            if (count > 0 || !hadLast[i]) {
+                last[i * 3] = offsets[i * 3]; last[i * 3 + 1] = offsets[i * 3 + 1]; last[i * 3 + 2] = offsets[i * 3 + 2]
+                hadLast[i] = true
+            }
+        }
+        for (i in 0..1) {
+            if (touching[i]) { hand[i * 3] = pin[i * 3]; hand[i * 3 + 1] = pin[i * 3 + 1]; hand[i * 3 + 2] = pin[i * 3 + 2] }
+            else { hand[i * 3] = x + offsets[i * 3]; hand[i * 3 + 1] = y + offsets[i * 3 + 1]; hand[i * 3 + 2] = z + offsets[i * 3 + 2] }
+        }
+    }
+
+    /**
+     * True when hand [i] can be believed in this step: it is followed, and since the last step it
+     * has not moved further than a hand can. Keeps [before] up to date.
+     */
+    private fun believable(i: Int): Boolean {
+        if (!usable[i]) { hasBefore[i] = false; return false }
+        var ok = true
+        if (hasBefore[i]) {
+            val dx = at[i * 3] - before[i * 3]; val dy = at[i * 3 + 1] - before[i * 3 + 1]; val dz = at[i * 3 + 2] - before[i * 3 + 2]
+            val limit = MAX_HAND_SPEED * reach * STEP
+            if (dx * dx + dy * dy + dz * dz > limit * limit) { ok = false; rejected++ }
+        }
+        return ok
+    }
+
+    private fun remember(i: Int) {
+        before[i * 3] = at[i * 3]; before[i * 3 + 1] = at[i * 3 + 1]; before[i * 3 + 2] = at[i * 3 + 2]
+        hasBefore[i] = true
+    }
+
+    private fun stepContact(world: ArenaWorld) {
+        val dt = STEP
+        sinceJump += dt
         val wasHeld = touching[0] || touching[1]
         if (!wasHeld) {
-            vy -= GRAVITY * dt
+            vy = (vy - GRAVITY * dt).coerceIn(-MAX_VERTICAL_SPEED, MAX_VERTICAL_SPEED)
             x += vx * dt; y += vy * dt; z += vz * dt
             collide(world)
-            if (onGround) {
-                val f = exp(-dt * FRICTION); vx *= f; vz *= f
-                if (vx * vx + vz * vz < STOP_SPEED * STOP_SPEED) { vx = 0f; vz = 0f }
-            }
+            if (onGround) slowDown(dt)
         }
 
         var held = 0
+        // A hold that ends because the hand cannot be believed gives the body no push.
+        var lost = false
         var mx = 0f; var my = 0f; var mz = 0f
         for (i in 0..1) {
-            if (!present[i]) { touching[i] = false; continue }
-            val qx = x + offsets[i * 3]; val qy = y + offsets[i * 3 + 1]; val qz = z + offsets[i * 3 + 2]
-            val d = world.distance(qx, qy, qz) - HAND_RADIUS
+            stroking[i] = false
+            val ok = believable(i)
+            if (usable[i]) remember(i)
+            if (!ok) { if (touching[i]) { touching[i] = false; lost = true }; free[i] = false; continue }
+            val qx = x + at[i * 3]; val qy = y + at[i * 3 + 1]; val qz = z + at[i * 3 + 2]
+            val d = world.distance(qx, qy, qz) - handRadius
+            if (d > TOUCH_MARGIN) free[i] = true
             if (!touching[i]) {
-                if (d <= TOUCH_MARGIN) {
+                // A hand takes hold where it arrives at a surface. One that turns up already deep
+                // inside something (found again there, or put there by a wrong reading) did not
+                // arrive: it holds nothing until it has come out.
+                if (d <= TOUCH_MARGIN && (free[i] || d >= -MAX_START_DEPTH)) {
                     // First touch: the hand stays on the surface, where it came in.
                     touching[i] = true
                     pin[i * 3] = qx - world.normal[0] * d; pin[i * 3 + 1] = qy - world.normal[1] * d
@@ -829,29 +1040,107 @@ class GorillaBody {
             vx = ax / historyCount; vy = ay / historyCount; vz = az / historyCount
         } else if (wasHeld) {
             // The last hand let go: the body keeps the speed the hands gave it.
-            vx *= JUMP_MULTIPLIER; vy *= JUMP_MULTIPLIER; vz *= JUMP_MULTIPLIER
+            val gain = if (lost) 1f else JUMP_MULTIPLIER
+            vx *= gain; vy *= gain; vz *= gain
             val speed = sqrt(vx * vx + vy * vy + vz * vz)
             if (speed > MAX_JUMP_SPEED) { val f = MAX_JUMP_SPEED / speed; vx *= f; vy *= f; vz *= f }
             if (speed < REST_SPEED) { vx = 0f; vy = 0f; vz = 0f }
-        }
-
-        for (i in 0..1) {
-            if (touching[i]) { hand[i * 3] = pin[i * 3]; hand[i * 3 + 1] = pin[i * 3 + 1]; hand[i * 3 + 2] = pin[i * 3 + 2] }
-            else { hand[i * 3] = x + offsets[i * 3]; hand[i * 3 + 1] = y + offsets[i * 3 + 1]; hand[i * 3 + 2] = z + offsets[i * 3 + 2] }
+            if (vy > JUMP_SPEED) sinceJump = 0f
         }
     }
 
-    /** Keeps the body out of everything solid and on top of the floor. */
-    private fun collide(world: ArenaWorld) {
-        for (pass in 0..2) {
-            val d = world.distance(x, y - CHEST_BELOW_EYES, z) - BODY_RADIUS
-            if (d >= 0f) break
-            val nx = world.normal[0]; val ny = world.normal[1]; val nz = world.normal[2]
-            x -= nx * d; y -= ny * d; z -= nz * d
-            val into = vx * nx + vy * ny + vz * nz
-            if (into < 0f) { vx -= into * nx; vy -= into * ny; vz -= into * nz }
+    private fun stepFluid(world: ArenaWorld) {
+        val dt = STEP
+        sinceJump += dt
+        vy = (vy - GRAVITY * dt).coerceIn(-MAX_VERTICAL_SPEED, MAX_VERTICAL_SPEED)
+        x += vx * dt; y += vy * dt; z += vz * dt
+        collide(world)
+        if (onGround) slowDown(dt)
+
+        var strokes = 0; var followed = 0; var down = 0
+        var px = 0f; var pz = 0f; var push = 0f
+        for (i in 0..1) {
+            touching[i] = false; stroking[i] = false
+            val ok = believable(i)
+            val known = hasBefore[i]
+            val o = i * 3
+            if (!ok || !known) {
+                // Back from a loss, or a jump that cannot be true: the speed starts again from nothing.
+                handSpeed[o] = 0f; handSpeed[o + 1] = 0f; handSpeed[o + 2] = 0f
+                ready[i] = false
+                if (usable[i]) remember(i)
+                continue
+            }
+            val k = 1f - exp(-dt / FLUID_SMOOTHING)
+            handSpeed[o] += ((at[o] - before[o]) / dt - handSpeed[o]) * k
+            handSpeed[o + 1] += ((at[o + 1] - before[o + 1]) / dt - handSpeed[o + 1]) * k
+            handSpeed[o + 2] += ((at[o + 2] - before[o + 2]) / dt - handSpeed[o + 2]) * k
+            remember(i)
+            followed++
+            // Only below the eyes: lifted to their level, the hand comes back without rowing back.
+            if (at[o + 1] > -FLUID_BELOW_EYES * reach) {
+                // What it does up there across the ground is forgotten, so none of the way back
+                // is still in the smoothed speed when the hand comes down for the next stroke.
+                handSpeed[o] = 0f; handSpeed[o + 2] = 0f
+                ready[i] = false; continue
+            }
+            val sx = handSpeed[o]; val sy = handSpeed[o + 1]; val sz = handSpeed[o + 2]
+            // A hand that comes down from the level of the eyes arrives fast, and that is no
+            // jump: the push has to start from a hand that was already down here.
+            if (-sy < FLUID_JUMP_HAND_SPEED * reach * .5f) ready[i] = true
+            if (ready[i] && -sy > FLUID_JUMP_HAND_SPEED * reach) { down++; push += -sy }
+            if (sx * sx + sy * sy + sz * sz < FLUID_DEAD_SPEED * reach * FLUID_DEAD_SPEED * reach) continue
+            stroking[i] = true; strokes++
+            px -= sx; pz -= sz
         }
-        val floor = world.floorAt(x, z) + EYE_HEIGHT
+        // Every hand that is followed pushes down at once: a jump. The push goes on for a moment,
+        // and the body leaves as fast as the hands got, not as fast as they started.
+        if (down == followed && down > 0) {
+            val up = min(push / down * FLUID_JUMP_GAIN, FLUID_MAX_JUMP_SPEED)
+            if (onGround && sinceJump >= JUMP_INTERVAL) { vy = up; sinceJump = 0f; onGround = false }
+            else if (sinceJump < FLUID_JUMP_BUILD && up > vy) vy = up
+        }
+        if (strokes == 0) return
+        // The body goes the other way, as fast as the hands go at most, and gets there bit by bit.
+        var tx = px / strokes * FLUID_GAIN; var tz = pz / strokes * FLUID_GAIN
+        var target = sqrt(tx * tx + tz * tz)
+        if (target > FLUID_MAX_SPEED) { tx *= FLUID_MAX_SPEED / target; tz *= FLUID_MAX_SPEED / target; target = FLUID_MAX_SPEED }
+        if (target > 1e-4f) {
+            val ux = tx / target; val uz = tz / target
+            val along = vx * ux + vz * uz
+            // A stroke only ever speeds the body up its own way; it never brakes a body already faster.
+            if (along < target) {
+                val add = min(FLUID_ACCELERATION * dt, target - along)
+                vx += ux * add; vz += uz * add
+            }
+        }
+    }
+
+    private fun slowDown(dt: Float) {
+        val f = exp(-dt * FRICTION); vx *= f; vz *= f
+        if (vx * vx + vz * vz < STOP_SPEED * STOP_SPEED) { vx = 0f; vz = 0f }
+    }
+
+    /** Keeps the head and the body out of everything solid and on top of the floor. */
+    private fun collide(world: ArenaWorld) {
+        val size = eyeHeight / EYE_HEIGHT
+        for (pass in 0..2) {
+            var clear = true
+            for (part in 0..1) {
+                // The chest, and then the head around the eyes.
+                val below = if (part == 0) CHEST_BELOW_EYES * size else 0f
+                val radius = if (part == 0) BODY_RADIUS * size else HEAD_RADIUS
+                val d = world.distance(x, y - below, z) - radius
+                if (d >= 0f) continue
+                clear = false
+                val nx = world.normal[0]; val ny = world.normal[1]; val nz = world.normal[2]
+                x -= nx * d; y -= ny * d; z -= nz * d
+                val into = vx * nx + vy * ny + vz * nz
+                if (into < 0f) { vx -= into * nx; vy -= into * ny; vz -= into * nz }
+            }
+            if (clear) break
+        }
+        val floor = world.floorAt(x, z) + eyeHeight
         if (y <= floor) {
             y = floor
             if (vy < 0f) vy = 0f
@@ -860,25 +1149,59 @@ class GorillaBody {
     }
 
     companion object {
+        /** Length of one step of the physics: 120 a second. */
+        const val STEP = 1f / 120f
+        /** Steps taken for one drawn frame at most; the time beyond them is dropped. */
+        const val MAX_STEPS = 8
         /** Height of the eyes above the floor at rest. Low on purpose: the hands have to reach the ground. */
         const val EYE_HEIGHT = .8f
-        /** The palm touches as a ball of this radius. */
+        const val MIN_EYE_HEIGHT = .5f
+        const val MAX_EYE_HEIGHT = 1.3f
+        const val MIN_REACH = 1.2f
+        const val MAX_REACH = 3.2f
+        /** Radius of the palm when the hands reach [Coliseum.ARM_SCALE] times as far as the real ones: 3.6 cm of real hand. */
         const val HAND_RADIUS = .09f
-        const val BODY_RADIUS = .30f
+        const val BODY_RADIUS = .25f
+        const val HEAD_RADIUS = .17f
         private const val CHEST_BELOW_EYES = .45f
         /** A hand this close to a surface takes hold of it. */
         const val TOUCH_MARGIN = .03f
         /** A held hand lets go when it is this far off the surface. Wide enough for the tremor of tracking. */
         const val RELEASE_DISTANCE = .12f
+        /** A real hand does not move faster than this (m/s); what does is a mistake of tracking. */
+        const val MAX_HAND_SPEED = 7f
+        /** No upward or downward speed beyond this, whatever happened. */
+        const val MAX_VERTICAL_SPEED = 10f
+        /** Seconds between two jumps. */
+        const val JUMP_INTERVAL = .45f
+        /** The fastest the hands can send the body off, and the fastest a stroke can row it. */
+        const val MAX_JUMP_SPEED = 8f
+        const val FLUID_MAX_SPEED = 6f
+        const val FLUID_ACCELERATION = 20f
+        /** A hand makes strokes when it is this far below the eyes, in real metres. */
+        const val FLUID_BELOW_EYES = .06f
+        /** Slower than this, in real metres a second, a hand is taken to be still. */
+        const val FLUID_DEAD_SPEED = .45f
+        /** A stroke downwards faster than this, in real metres a second, is a jump. */
+        const val FLUID_JUMP_HAND_SPEED = .9f
+        const val FLUID_MAX_JUMP_SPEED = 5.5f
+        /** The push of a jump can go on building for this long after the body has left the ground. */
+        private const val FLUID_JUMP_BUILD = .15f
+        /** A hand found deeper than this inside something holds nothing until it has come out. */
+        private const val MAX_START_DEPTH = .15f
+        private const val FLUID_GAIN = 1f
+        private const val FLUID_JUMP_GAIN = 1.2f
+        private const val FLUID_SMOOTHING = .06f
         private const val UNSTICK_DISTANCE = 1.0f
         private const val FOLLOW = 30f
-        private const val GRAVITY = 9.8f
+        private const val GRAVITY = 9.81f
         private const val FRICTION = 2.2f
         private const val MAX_SPEED = 10f
         private const val JUMP_MULTIPLIER = 1.1f
-        private const val MAX_JUMP_SPEED = 8f
+        private const val JUMP_SPEED = 1.5f
         private const val REST_SPEED = .25f
         private const val STOP_SPEED = .06f
-        private const val HISTORY = 6
+        /** A tenth of a second of steps. */
+        private const val HISTORY = 12
     }
 }

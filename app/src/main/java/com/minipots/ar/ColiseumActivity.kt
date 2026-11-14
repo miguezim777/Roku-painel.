@@ -1,8 +1,11 @@
 package com.minipots.ar
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -13,7 +16,11 @@ import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.opengl.GLSurfaceView
+import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Size
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -63,7 +70,17 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     private lateinit var stereoButton: Button
     private lateinit var ipdLabel: Button
     private lateinit var overlay: LinearLayout
+    private lateinit var modeButton: Button
+    private lateinit var bodyLabel: Button
     private var stereoOn = true
+    // How the hands move the body, how high the eyes are, and how far the hands reach.
+    private var fluid = false
+    private var eyeCm = DEFAULT_EYE_CM
+    private var reachTenths = DEFAULT_REACH_TENTHS
+    // The last minutes of the line of measurements, to be copied out.
+    private val measurements = ArrayDeque<String>()
+    private var heat = ""
+    private var heatAtMs = 0L
     private var ipdMm = 63
     private var lensMm = 42
     private var quarterTurns = 1
@@ -112,6 +129,9 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         stereoOn = settings.getBoolean(KEY_STEREO, true)
         ipdMm = settings.getInt(KEY_IPD, 63).coerceIn(MIN_IPD_MM, MAX_IPD_MM)
         lensMm = settings.getInt(KEY_LENS, 42).coerceIn(MIN_LENS_MM, MAX_LENS_MM)
+        fluid = settings.getBoolean(KEY_FLUID, false)
+        eyeCm = settings.getInt(KEY_EYE_CM, DEFAULT_EYE_CM).coerceIn(MIN_EYE_CM, MAX_EYE_CM)
+        reachTenths = settings.getInt(KEY_REACH, DEFAULT_REACH_TENTHS).coerceIn(MIN_REACH_TENTHS, MAX_REACH_TENTHS)
         findLookModes()
 
         analysisExecutor = Executors.newSingleThreadExecutor { Thread(it, "hand-tracking") }
@@ -132,6 +152,7 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
+        applyBody()
         // A finger dragged over the picture turns the view; a tap shows or hides the controls.
         surface.setOnTouchListener { view, event ->
             when (event.actionMasked) {
@@ -187,9 +208,16 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         button("Escala −") { lensMm = (lensMm - 2).coerceAtLeast(MIN_LENS_MM); saveStereo() }
         button("Escala +") { lensMm = (lensMm + 2).coerceAtMost(MAX_LENS_MM); saveStereo() }
         lookButton = button(lookLabel()) { nextLookMode() }
+        modeButton = button(modeLabel()) { fluid = !fluid; saveBody(); renderer.showNotice(modeNotice()) }
+        button("Altura −") { eyeCm = (eyeCm - 5).coerceAtLeast(MIN_EYE_CM); saveBody() }
+        bodyLabel = button(bodyText()) { eyeCm = DEFAULT_EYE_CM; reachTenths = DEFAULT_REACH_TENTHS; saveBody() }
+        button("Altura +") { eyeCm = (eyeCm + 5).coerceAtMost(MAX_EYE_CM); saveBody() }
+        button("Mãos −") { reachTenths = (reachTenths - 1).coerceAtLeast(MIN_REACH_TENTHS); saveBody() }
+        button("Mãos +") { reachTenths = (reachTenths + 1).coerceAtMost(MAX_REACH_TENTHS); saveBody() }
         button("Recomeçar") { surface.queueEvent { renderer.restart() } }
         button("Câmera ⟲") { frontCamera = !frontCamera; bindCamera() }
         button("CPU ⇄ GPU") { surface.queueEvent { renderer.stopChoosingProcessor() }; processorSetting.switchByHand() }
+        button("Copiar medições") { copyMeasurements() }
         button("Potinhos") { openPots() }
         scroll.addView(line); overlay.addView(scroll)
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1, Gravity.TOP))
@@ -210,7 +238,75 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
     // ---------------------------------------------------------------- ColiseumRenderer.Callbacks (GL thread)
 
     override fun status(text: String) { runOnUiThread { showStatus(text) } }
-    override fun stats(text: String) { runOnUiThread { stats.text = text } }
+    override fun stats(text: String) {
+        runOnUiThread {
+            val line = text + heatText()
+            stats.text = line
+            measurements.addLast(line)
+            while (measurements.size > MAX_MEASUREMENTS) measurements.removeFirst()
+        }
+    }
+
+    /**
+     * How warm the phone is, for the line of measurements: the temperature of the battery, which
+     * every phone reports, and from Android 10 on how hard the system is holding the phone back
+     * because of heat (0 is not at all). Looked up every few seconds.
+     */
+    private fun heatText(): String {
+        val now = SystemClock.elapsedRealtime()
+        if (heatAtMs != 0L && now - heatAtMs < HEAT_EVERY_MS) return heat
+        heatAtMs = now
+        var text = ""
+        try {
+            val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val tenths = battery?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE
+            if (tenths != Int.MIN_VALUE) text += " · bateria ${tenths / 10} °C"
+        } catch (_: Exception) {}
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val status = (getSystemService(Context.POWER_SERVICE) as PowerManager).currentThermalStatus
+                text += " · freio térmico $status"
+            } catch (_: Exception) {}
+        }
+        heat = text
+        return text
+    }
+
+    /** Puts the last minutes of measurements on the clipboard, with what they were measured on. */
+    private fun copyMeasurements() {
+        val text = StringBuilder()
+        text.append("Coliseu · ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}\n")
+        text.append("${lookLabel()} · ${modeLabel()} · ${bodyText()} · ${stereoLabel()}\n")
+        for (line in measurements) text.append(line).append('\n')
+        try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("Medições do Coliseu", text.toString()))
+            renderer.showNotice("${measurements.size} linhas de medições copiadas. Cole onde quiser enviar.")
+        } catch (e: Exception) {
+            renderer.showNotice("Não foi possível copiar: ${e.localizedMessage ?: e.javaClass.simpleName}")
+        }
+    }
+
+    // ---------------------------------------------------------------- the body
+
+    private fun modeLabel() = if (fluid) "Andar: fluido" else "Andar: contato"
+    private fun bodyText() = "Altura $eyeCm cm · mãos ${reachTenths / 10},${reachTenths % 10}×"
+
+    private fun modeNotice() = if (fluid)
+        "Modo fluido: não é preciso tocar em nada. Com a mão abaixo dos olhos, puxe para trás para ir para a frente; suba a mão para trazê-la de volta. As mãos para baixo, de uma vez, pulam."
+    else "Modo contato: a mão precisa tocar o chão ou a parede. Encoste e puxe para andar, empurre para pular, puxe a parede para baixo para subir."
+
+    private fun saveBody() {
+        settings.edit().putBoolean(KEY_FLUID, fluid).putInt(KEY_EYE_CM, eyeCm).putInt(KEY_REACH, reachTenths).apply()
+        modeButton.text = modeLabel(); bodyLabel.text = bodyText()
+        applyBody()
+    }
+
+    private fun applyBody() {
+        val mode = if (fluid) Locomotion.FLUID else Locomotion.CONTACT
+        val height = eyeCm / 100f; val reach = reachTenths / 10f
+        surface.queueEvent { renderer.setLocomotion(mode); renderer.setBody(height, reach) }
+    }
 
     override fun processor(action: ProcessorChooser.Action, cpuMs: Float, gpuMs: Float, cpuFps: Float, gpuFps: Float) {
         runOnUiThread { processorSetting.measured(action, cpuMs, gpuMs, cpuFps, gpuFps) }
@@ -548,6 +644,18 @@ class ColiseumActivity : ComponentActivity(), ColiseumRenderer.Callbacks, HandTr
         const val KEY_STEREO = "stereo"
         const val KEY_IPD = "ipd_mm"
         const val KEY_LENS = "lens_mm"
+        const val KEY_FLUID = "locomotion_fluid"
+        const val KEY_EYE_CM = "eye_cm"
+        const val KEY_REACH = "reach_tenths"
+        const val DEFAULT_EYE_CM = 80
+        const val MIN_EYE_CM = 50
+        const val MAX_EYE_CM = 130
+        const val DEFAULT_REACH_TENTHS = 25
+        const val MIN_REACH_TENTHS = 12
+        const val MAX_REACH_TENTHS = 32
+        /** Three minutes of the line of measurements, one a second. */
+        const val MAX_MEASUREMENTS = 180
+        const val HEAT_EVERY_MS = 5_000L
         const val MIN_IPD_MM = 52
         const val MAX_IPD_MM = 74
         const val MIN_LENS_MM = 28

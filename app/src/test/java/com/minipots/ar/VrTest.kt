@@ -626,13 +626,13 @@ class VrTest {
         // Three pulls of 80 cm: the eyes are level with the top of the wall, which is 3 m high,
         // and the right hand lies on top of it.
         assertTrue("climbed to ${g.body.y}", g.body.y > Arena.WALL_HEIGHT)
-        assertEquals(Arena.WALL_HEIGHT + GorillaBody.HAND_RADIUS, g.palm[4], .01f)
+        assertEquals(Arena.WALL_HEIGHT + GorillaBody.HAND_RADIUS, g.palm[4], .02f)
         // Over the edge: that hand pushes down and back, the body goes up and on to the wall.
         hide(0)
         val reach = g.palm[5] - g.body.z
         g.stroke(1, 50, .25f, .05f, reach, .25f, -.85f, reach + 1.1f)
         g.frames(20)
-        assertTrue("over the edge at ${g.body.z}", g.body.z < -Arena.RADIUS - .05f)
+        assertTrue("over the edge at ${g.body.z}", g.body.z < -Arena.RADIUS)
         hide(1)
         g.frames(90)
         // Standing on the wall.

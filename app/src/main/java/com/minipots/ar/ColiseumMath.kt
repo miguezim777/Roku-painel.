@@ -83,6 +83,22 @@ object Look {
         out[2] = if (abs(up) + abs(right) < .15f * length) 0f else atan2(-right, up)
     }
 
+    /**
+     * The turn of a head with this [yaw], [pitch] and [roll], as [ArenaCamera] understands them:
+     * nine numbers in [out], three rows, that take a vector along the axes of the camera (x right,
+     * y up, z towards the viewer) to the axes of the world.
+     */
+    fun cameraToWorld(yaw: Float, pitch: Float, roll: Float, out: FloatArray) {
+        val cy = cos(yaw); val sy = sin(yaw); val cp = cos(pitch); val sp = sin(pitch)
+        val fx = sy * cp; val fy = sp; val fz = -cy * cp
+        val lx = cy; val lz = sy
+        val vx = -sy * sp; val vy = cp; val vz = cy * sp
+        val cr = cos(roll); val sr = sin(roll)
+        out[0] = lx * cr - vx * sr; out[3] = -vy * sr; out[6] = lz * cr - vz * sr
+        out[1] = vx * cr + lx * sr; out[4] = vy * cr; out[7] = vz * cr + lz * sr
+        out[2] = -fx; out[5] = -fy; out[8] = -fz
+    }
+
     /** Difference a - b wrapped to -PI..PI. */
     fun angleDifference(a: Float, b: Float): Float {
         var d = (a - b) % TWO_PI
@@ -396,6 +412,11 @@ class Dummy(val x: Float, val z: Float) {
 class HandInput {
     /** The hand is followed (or its last pose is still being held). */
     var present = false
+    /**
+     * Its tracking is fresh. A hand that is present but not live is only the last pose being
+     * held: it is drawn and keeps its weapon, but it moves nothing and takes hold of nothing.
+     */
+    var live = true
     /** The hand is closed into a fist. */
     var closed = false
     /** Its 21 points in camera space, in real metres. */
@@ -437,6 +458,24 @@ class Coliseum {
 
     /** Which hands are in the world now. */
     val handPresent = booleanArrayOf(false, false)
+    /** Which of them are followed right now, and not only held where they were last seen. */
+    val handLive = booleanArrayOf(false, false)
+    /**
+     * How many times further than the real hands the hands reach, and how many times bigger they
+     * are (see [ARM_SCALE]). Smaller brings the hands nearer to their real size and place; the
+     * ground is then further from them.
+     */
+    var reach = ARM_SCALE
+        set(value) { field = value.coerceIn(GorillaBody.MIN_REACH, GorillaBody.MAX_REACH); body.reach = field }
+    /** Height of the eyes above the floor at rest. */
+    var eyeHeight: Float
+        get() = body.eyeHeight
+        set(value) {
+            val rise = value.coerceIn(GorillaBody.MIN_EYE_HEIGHT, GorillaBody.MAX_EYE_HEIGHT) - body.eyeHeight
+            body.eyeHeight = value
+            // The body grows or shrinks from its feet: the eyes go with it.
+            body.y += rise
+        }
     /** The 21 points of each hand in the world, at the scale of the player's long arms. */
     val handJoints = arrayOf(FloatArray(HAND_POINTS * 3), FloatArray(HAND_POINTS * 3))
     /** Middle of each palm in the world (x, y, z per hand). */
@@ -444,7 +483,7 @@ class Coliseum {
     /** Shoulder and elbow of each arm in the world (x, y, z per arm); the wrist is the first joint of the hand. */
     val shoulder = FloatArray(6)
     val elbow = FloatArray(6)
-    /** How many times longer than [ArmPose.BONE] the bones of each arm are right now. */
+    /** How many times longer than at rest the bones of each arm are right now. */
     val armStretch = floatArrayOf(1f, 1f)
 
     private val offsets = FloatArray(6)
@@ -466,7 +505,7 @@ class Coliseum {
     init { restart() }
 
     fun restart() {
-        body.reset(0f, GorillaBody.EYE_HEIGHT, Arena.START_Z)
+        body.reset(0f, body.eyeHeight, Arena.START_Z)
         for (w in weapons) w.plant(w.homeX, w.homeZ)
         for (d in dummies) d.reset()
         held[0] = null; held[1] = null
@@ -488,13 +527,14 @@ class Coliseum {
 
         for (i in 0..1) {
             handPresent[i] = hands[i].present
+            handLive[i] = hands[i].present && hands[i].live
             if (!handPresent[i]) continue
             palmOf(hands[i].joints)
-            offsets[i * 3] = c.worldX(local[0], local[1], local[2]) * ARM_SCALE
-            offsets[i * 3 + 1] = c.worldY(local[0], local[1], local[2]) * ARM_SCALE
-            offsets[i * 3 + 2] = c.worldZ(local[0], local[1], local[2]) * ARM_SCALE
+            offsets[i * 3] = c.worldX(local[0], local[1], local[2]) * reach
+            offsets[i * 3 + 1] = c.worldY(local[0], local[1], local[2]) * reach
+            offsets[i * 3 + 2] = c.worldZ(local[0], local[1], local[2]) * reach
         }
-        body.update(dt, world, handPresent, offsets)
+        body.update(dt, world, handPresent, handLive, offsets)
         c.place(body.x, body.y, body.z, yaw, pitch, roll)
 
         for (i in 0..1) {
@@ -505,8 +545,8 @@ class Coliseum {
             palm[i * 3] = px; palm[i * 3 + 1] = py; palm[i * 3 + 2] = pz
             val out = handJoints[i]
             for (k in 0 until HAND_POINTS) {
-                val x = (j[k * 3] - local[0]) * ARM_SCALE; val y = (j[k * 3 + 1] - local[1]) * ARM_SCALE
-                val z = (j[k * 3 + 2] - local[2]) * ARM_SCALE
+                val x = (j[k * 3] - local[0]) * reach; val y = (j[k * 3 + 1] - local[1]) * reach
+                val z = (j[k * 3 + 2] - local[2]) * reach
                 out[k * 3] = px + c.worldX(x, y, z); out[k * 3 + 1] = py + c.worldY(x, y, z); out[k * 3 + 2] = pz + c.worldZ(x, y, z)
             }
             // Speed of the real hand in the world, which is what a thrown weapon leaves with.
@@ -524,7 +564,7 @@ class Coliseum {
             ArmPose.shoulder(body.x, body.y, body.z, yaw, side, shoulder, i * 3)
             if (!handPresent[i]) continue
             val j = handJoints[i]
-            armStretch[i] = ArmPose.elbow(shoulder, i * 3, j[0], j[1], j[2], yaw, side, elbow)
+            armStretch[i] = ArmPose.elbow(shoulder, i * 3, j[0], j[1], j[2], yaw, side, elbow, ArmPose.BONE * reach / ARM_SCALE)
         }
 
         for (i in 0..1) {

@@ -2,6 +2,7 @@ package com.minipots.ar
 
 import android.opengl.GLES20.*
 import android.opengl.GLSurfaceView
+import android.os.Debug
 import android.os.Process
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
@@ -65,6 +66,17 @@ class ColiseumRenderer(
     private val inputs = arrayOf(HandInput(), HandInput())
     /** Seconds since each hand was last followed; large when it never was. */
     private val lostFor = floatArrayOf(NEVER_SEEN, NEVER_SEEN)
+    private val handConfidence = FloatArray(2)
+    // How the head was turned lately, to put each reading of a hand where the head was when its
+    // picture was taken (see [HandRig.accept]). Only with a sensor that follows the real head.
+    private val history = LookHistory()
+    private val lookAt = FloatArray(3)
+    private val turnThen = FloatArray(9)
+    private val turnNow = FloatArray(9)
+    private var steady = false
+    private var droppedFrames = 0
+    private val handPalmSign = FloatArray(2)
+    private val handMark = IntArray(2)
 
     private var lastFrameNs = 0L
     private var seconds = 0f
@@ -94,6 +106,12 @@ class ColiseumRenderer(
 
     /** The direction the head points to now becomes "forward", towards the middle of the arena. */
     fun recentre() { look.recentre() }
+
+    /** How the hands move the body. */
+    fun setLocomotion(mode: Locomotion) { game.body.mode = mode; statusKey = -1L }
+
+    /** Height of the eyes above the floor, and how many times further than the real hands the hands reach. */
+    fun setBody(eyeHeight: Float, reach: Float) { game.eyeHeight = eyeHeight; game.reach = reach }
 
     /** The user chose the processor by hand: the automatic comparison stops. */
     fun stopChoosingProcessor() { chooser = null }
@@ -128,6 +146,8 @@ class ColiseumRenderer(
     override fun onDrawFrame(gl: GL10?) {
         val now = System.nanoTime()
         val dt = if (lastFrameNs == 0L) .016f else min((now - lastFrameNs) / 1e9f, .05f)
+        // A frame that took as long as two or more: the screen showed the one before again.
+        if (lastFrameNs != 0L && now - lastFrameNs > DROPPED_FRAME_NS) droppedFrames++
         lastFrameNs = now
         seconds += dt
         glDisable(GL_SCISSOR_TEST)
@@ -143,18 +163,27 @@ class ColiseumRenderer(
         }
         roll = roll.coerceIn(-MAX_ROLL, MAX_ROLL)
         look.update(lookMode, sensors.yaw, sensors.pitch, sensors.ready)
+        // Dragging a finger or leaning to turn moves the view without moving the head, so the
+        // hands stay with the camera then; only a sensor that follows the head steadies them.
+        val steadyNow = lookMode == LookMode.GYROSCOPE && sensors.ready
+        if (steadyNow != steady) { steady = steadyNow; history.clear(); rigs[0].reset(); rigs[1].reset() }
+        if (steady) {
+            history.add(now, sensors.yaw, look.pitch, roll)
+            Look.cameraToWorld(sensors.yaw, look.pitch, roll, turnNow)
+        }
         updateHands(dt, now)
         game.update(dt, look.yaw, look.pitch, roll, inputs)
         if (game.blowStrength > 0f) callbacks.blow(game.blowStrength)
 
         val c = game.camera
         stereo.layout(width, height)
+        for (i in 0..1) { handConfidence[i] = rigs[i].confidence; handPalmSign[i] = rigs[i].palmSign; handMark[i] = markOf(i) }
         for (eye in 0 until stereo.eyes) {
             val x = stereo.viewportX(eye); val w = stereo.viewportWidth(eye)
             glViewport(x, 0, w, stereo.viewportHeight)
             glEnable(GL_SCISSOR_TEST); glScissor(x, 0, w, stereo.viewportHeight)
             c.eye(stereo.eyeOffset(eye), stereo.left(eye), stereo.right(eye), stereo.top)
-            drawScene(d, c)
+            d.scene(game, c, handConfidence, handPalmSign, handMark, seconds)
         }
         glDisable(GL_SCISSOR_TEST)
 
@@ -163,47 +192,12 @@ class ColiseumRenderer(
         updateStats(now)
     }
 
-    /** Everything, as the eye that [c] is set to sees it. */
-    private fun drawScene(d: ColiseumDrawing, c: ArenaCamera) {
-        d.begin(c.viewProjection)
-        glDisable(GL_DEPTH_TEST); glDepthMask(false); glDisable(GL_BLEND)
-        d.sky(c.eyeX, c.eyeY, c.eyeZ)
-        glEnable(GL_DEPTH_TEST); glDepthMask(true)
-        d.arena()
-
-        // Shadows lie on the sand, which nothing in the arena hides: no depth test needed, and no
-        // flicker from two surfaces at the same height.
-        glDisable(GL_DEPTH_TEST); glDepthMask(false); glEnable(GL_BLEND)
-        for (dummy in game.dummies) if (dummy.standing > .02f) d.shadow(dummy.x, dummy.z, .46f * dummy.standing, .30f * dummy.standing)
-        for (weapon in game.weapons) {
-            if (game.world.floorAt(weapon.x, weapon.z) > 0f) continue
-            if (weapon.held || weapon.flying) d.shadow(weapon.x, weapon.z, .20f, .16f) else d.shadow(weapon.x, weapon.z, .17f, .26f)
-        }
-        for (i in 0..1) if (game.handPresent[i]) {
-            val x = game.palm[i * 3]; val y = game.palm[i * 3 + 1]; val z = game.palm[i * 3 + 2]
-            if (game.world.floorAt(x, z) > 0f) continue
-            // The shadow tells how high the hand is, which is what moving depends on.
-            val above = max(0f, y)
-            d.shadow(x, z, .17f + above * .10f, (.34f - above * .16f).coerceIn(.08f, .34f))
-            if (game.body.touching[i] && y < .3f) d.spot(x, z, .30f, 1f, 1f, 1f, .28f)
-        }
-        glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glDepthMask(true)
-
-        for (dummy in game.dummies) d.dummy(dummy)
-        for (weapon in game.weapons) d.weapon(weapon)
-        for (i in 0..1) if (game.handPresent[i]) {
-            val j = game.handJoints[i]
-            d.arm(game.shoulder, game.elbow, i * 3, j[0], j[1], j[2], Coliseum.ARM_SCALE, rigs[i].confidence, c.eyeX, c.eyeY, c.eyeZ)
-            d.hand(j, Coliseum.ARM_SCALE, rigs[i].palmSign, rigs[i].confidence, c.eyeX, c.eyeY, c.eyeZ)
-        }
-
-        // A hand that is not followed is never drawn as if it were: a small dot says so instead.
-        var any = false
-        for (i in 0..1) if (showLost(i)) {
-            if (!any) { glDisable(GL_DEPTH_TEST); glDepthMask(false); glEnable(GL_BLEND); any = true }
-            d.lostMarker(c, if (i == 0) -1f else 1f, .75f + .25f * kotlin.math.sin(seconds * 4f))
-        }
-        if (any) { glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glDepthMask(true) }
+    /** The dot that tells how hand [i] is followed. */
+    private fun markOf(i: Int): Int = when {
+        showLost(i) -> ColiseumDrawing.MARK_LOST
+        rigs[i].state == HandRig.State.HELD -> ColiseumDrawing.MARK_HELD
+        rigs[i].state == HandRig.State.TRACKED -> ColiseumDrawing.MARK_LIVE
+        else -> ColiseumDrawing.MARK_NONE
     }
 
     /**
@@ -222,7 +216,16 @@ class ColiseumRenderer(
     private fun updateHands(dt: Float, now: Long) {
         if (tracker.frames.read(frame)) {
             statsResults++
-            for (i in 0..1) if (frame.hands[i].present) rigs[i].accept(frame.hands[i], frame.timeNs, frame.aspect, frame.focal)
+            var turn: FloatArray? = null
+            if (steady) {
+                // The reading is stamped when work started on its picture; the picture itself is
+                // older by the age the tracker measures.
+                val age = tracker.frameAgeMs
+                val takenNs = frame.timeNs - (if (age > 0f) (age * 1e6f).toLong() else 0L)
+                if (history.at(takenNs, lookAt)) { Look.cameraToWorld(lookAt[0], lookAt[1], lookAt[2], turnThen); turn = turnThen }
+                else turn = turnNow
+            }
+            for (i in 0..1) if (frame.hands[i].present) rigs[i].accept(frame.hands[i], frame.timeNs, frame.aspect, frame.focal, turn)
         }
         for (i in 0..1) {
             val rig = rigs[i]
@@ -231,8 +234,19 @@ class ColiseumRenderer(
             lostFor[i] = if (shown) 0f else min(lostFor[i] + dt, NEVER_SEEN)
             val input = inputs[i]
             input.present = shown
+            // Only a hand whose readings are fresh moves the body; a held pose is just drawn.
+            input.live = rig.state == HandRig.State.TRACKED
             input.closed = shown && rig.closed
-            if (shown) System.arraycopy(rig.joints, 0, input.joints, 0, input.joints.size)
+            if (!shown) continue
+            if (!steady) { System.arraycopy(rig.joints, 0, input.joints, 0, input.joints.size); continue }
+            // From the steady axes back to those of the camera as the head is turned now.
+            val t = turnNow; val from = rig.joints; val to = input.joints
+            for (k in 0 until HAND_POINTS) {
+                val x = from[k * 3]; val y = from[k * 3 + 1]; val z = from[k * 3 + 2]
+                to[k * 3] = t[0] * x + t[3] * y + t[6] * z
+                to[k * 3 + 1] = t[1] * x + t[4] * y + t[7] * z
+                to[k * 3 + 2] = t[2] * x + t[5] * y + t[8] * z
+            }
         }
     }
 
@@ -252,8 +266,9 @@ class ColiseumRenderer(
         val shown = (if (inputs[0].present) 1 else 0) + (if (inputs[1].present) 1 else 0)
         val armed = game.held[0] != null || game.held[1] != null
         val state = if (error != null) 9L else if (shown == 0) 1L else if (armed) 3L else 2L
-        val key = state * 100_000_000L + lookMode.ordinal * 10_000_000L + (if (stereo.stereo) 5_000_000L else 0L) +
-            game.blows * 1_000L + game.dummiesDown
+        val fluid = game.body.mode == Locomotion.FLUID
+        val key = state * 1_000_000_000L + (if (fluid) 100_000_000L else 0L) + lookMode.ordinal * 10_000_000L +
+            (if (stereo.stereo) 5_000_000L else 0L) + game.blows * 1_000L + game.dummiesDown
         if (key == statusKey) return
         statusKey = key
         callbacks.status(when {
@@ -264,7 +279,8 @@ class ColiseumRenderer(
                 LookMode.TOUCH -> "Arraste o dedo na tela para olhar em volta."
             }
             armed -> "Golpes: ${game.blows} · Bonecos derrubados: ${game.dummiesDown}. Bata nos bonecos de palha. A arma fica na mão sozinha; para largar, feche a mão e abra."
-            else -> "Olhe para baixo, encoste a mão no chão e puxe para andar (como no Gorilla Tag). Empurre o chão para pular. Encoste a mão no cabo de uma arma para pegar: não precisa segurar."
+            fluid -> "Modo fluido: com a mão abaixo dos olhos, puxe o ar para trás para ir para a frente (ou para um lado, para ir para o outro). Suba a mão até a altura dos olhos para trazê-la de volta. As mãos para baixo, de uma vez, pulam."
+            else -> "Olhe para baixo, encoste a mão no chão e puxe para andar (como no Gorilla Tag). Empurre o chão para pular; puxe a parede para baixo para subir. Encoste a mão no cabo de uma arma para pegar: não precisa segurar."
         })
     }
 
@@ -287,10 +303,19 @@ class ColiseumRenderer(
         val age = tracker.frameAgeMs
         val delay = if (age >= 0f) "${(age + tracker.frameCostMs).roundToInt()} ms" else "≥${tracker.frameCostMs.roundToInt()} ms"
         val where = (if (tracker.usingGpu) "GPU" else "CPU") + (if (tracker.lightModel) " leve" else "")
+        // Memory in use: what the app's own objects take, and what the native side (the model,
+        // the camera buffers) takes.
+        val runtime = Runtime.getRuntime()
+        val heapMb = ((runtime.totalMemory() - runtime.freeMemory()) / 1_048_576L).toInt()
+        val nativeMb = try { (Debug.getNativeHeapAllocatedSize() / 1_048_576L).toInt() } catch (_: Throwable) { -1 }
+        val memory = if (nativeMb >= 0) "$heapMb+$nativeMb MB" else "$heapMb MB"
+        val moving = if (game.body.mode == Locomotion.FLUID) "fluido" else "contato"
         callbacks.stats(
-            "tela $fps qps (${(drawMs * 10f).roundToInt() / 10f} ms) · câmera $camera qps · rastreio $results Hz · " +
-                "rede $inference ms · atraso $delay · mãos ${tracker.handsInView} · $where"
+            "tela $fps qps (${(drawMs * 10f).roundToInt() / 10f} ms) · quedas $droppedFrames · câmera $camera qps · rastreio $results Hz · " +
+                "rede $inference ms · atraso $delay · mãos ${tracker.handsInView} · $where · física ${(1f / GorillaBody.STEP).roundToInt()} Hz $moving · " +
+                "saltos de mão ${game.body.rejected + rigs[0].rejected + rigs[1].rejected} · mem $memory"
         )
+        droppedFrames = 0
         statsStartNs = now; statsFrames = 0; statsDrawNs = 0L; statsResults = 0
         chooser?.let { c ->
             val action = c.onSecond(fps, tracker.trackedFrames, tracker.trackedCostMs, tracker.usingGpu, tracker.preferGpu)
@@ -301,6 +326,8 @@ class ColiseumRenderer(
 
     private companion object {
         const val NEVER_SEEN = 1e6f
+        /** A frame later than this after the one before missed at least one refresh of a 60 Hz screen. */
+        const val DROPPED_FRAME_NS = 25_000_000L
         /** A hand away for this long, while the other one plays, is no longer pointed out. */
         const val FORGET_HAND_SECONDS = 8f
         /** Leaning the head further than this (radians) turns the view, in the mode without gyroscope. */

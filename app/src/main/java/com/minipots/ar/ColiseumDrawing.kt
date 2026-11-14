@@ -70,6 +70,63 @@ class ColiseumDrawing {
         glEnableVertexAttribArray(0); glEnableVertexAttribArray(1)
     }
 
+    /**
+     * Everything in [game], as the eye that [c] is set to sees it. For each hand, [confidence]
+     * and [palmSign] are those of its [HandRig] and [mark] is the dot that tells how it is
+     * followed ([MARK_NONE], [MARK_LOST], [MARK_HELD] or [MARK_LIVE]). [seconds] runs on and makes
+     * the dot of a lost hand pulse.
+     */
+    fun scene(game: Coliseum, c: ArenaCamera, confidence: FloatArray, palmSign: FloatArray, mark: IntArray, seconds: Float) {
+        begin(c.viewProjection)
+        glDisable(GL_DEPTH_TEST); glDepthMask(false); glDisable(GL_BLEND)
+        sky(c.eyeX, c.eyeY, c.eyeZ)
+        glEnable(GL_DEPTH_TEST); glDepthMask(true)
+        arena()
+
+        // Shadows lie on the sand, which nothing in the arena hides: no depth test needed, and no
+        // flicker from two surfaces at the same height.
+        glDisable(GL_DEPTH_TEST); glDepthMask(false); glEnable(GL_BLEND)
+        for (dummy in game.dummies) if (dummy.standing > .02f) shadow(dummy.x, dummy.z, .46f * dummy.standing, .30f * dummy.standing)
+        for (weapon in game.weapons) {
+            if (game.world.floorAt(weapon.x, weapon.z) > 0f) continue
+            if (weapon.held || weapon.flying) shadow(weapon.x, weapon.z, .20f, .16f) else shadow(weapon.x, weapon.z, .17f, .26f)
+        }
+        for (i in 0..1) if (game.handPresent[i]) {
+            val x = game.palm[i * 3]; val y = game.palm[i * 3 + 1]; val z = game.palm[i * 3 + 2]
+            if (game.world.floorAt(x, z) > 0f) continue
+            // The shadow tells how high the hand is, which is what moving depends on.
+            val above = max(0f, y)
+            shadow(x, z, .17f + above * .10f, (.34f - above * .16f).coerceIn(.08f, .34f))
+            if (game.body.touching[i] && y < .3f) spot(x, z, .30f, 1f, 1f, 1f, .28f)
+            // A stroke that rows the body along shows on the sand under the hand, in green.
+            if (game.body.stroking[i]) spot(x, z, .26f, LIVE_R, LIVE_G, LIVE_B, .34f)
+        }
+        glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glDepthMask(true)
+
+        for (dummy in game.dummies) dummy(dummy)
+        for (weapon in game.weapons) weapon(weapon)
+        for (i in 0..1) if (game.handPresent[i]) {
+            val j = game.handJoints[i]
+            arm(game.shoulder, game.elbow, i * 3, j[0], j[1], j[2], game.reach, confidence[i], c.eyeX, c.eyeY, c.eyeZ)
+            hand(j, game.reach, palmSign[i], confidence[i], c.eyeX, c.eyeY, c.eyeZ)
+        }
+
+        // A hand that is not followed is never drawn as if it were: a dot low on its side of the
+        // view says so instead, red. The dot is amber while the last pose is only being held, and
+        // small and green while the hand is followed.
+        var any = false
+        for (i in 0..1) if (mark[i] != MARK_NONE) {
+            if (!any) { glDisable(GL_DEPTH_TEST); glDepthMask(false); glEnable(GL_BLEND); any = true }
+            val side = if (i == 0) -1f else 1f
+            when (mark[i]) {
+                MARK_LOST -> marker(c, side, 1f, LOST_R, LOST_G, LOST_B, .75f + .25f * sin(seconds * 4f))
+                MARK_HELD -> marker(c, side, .8f, 1f, .70f, .22f, .8f)
+                else -> marker(c, side, .5f, LIVE_R, LIVE_G, LIVE_B, .8f)
+            }
+        }
+        if (any) { glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glDepthMask(true) }
+    }
+
     /** The sky is drawn around the eyes, so it never comes closer. Depth must be off. */
     fun sky(eyeX: Float, eyeY: Float, eyeZ: Float) {
         Mat4.identity(model); Mat4.translate(model, eyeX, eyeY, eyeZ)
@@ -264,17 +321,18 @@ class ColiseumDrawing {
     private fun fade(value: Float, sure: Float) = .52f + (value - .52f) * (.35f + .65f * sure)
 
     /**
-     * A small amber dot low in the view, on the side of a hand that is not followed. It floats
-     * [distance] metres in front of the head, so both eyes see it at the same depth. Needs
-     * blending on and depth off. [side] is -1 for the left hand and 1 for the right one.
+     * A dot low in the view, on the side of a hand, that tells how that hand is followed. It
+     * floats 1.4 m in front of the head, so both eyes see it at the same depth. Needs blending on
+     * and depth off. [side] is -1 for the left hand and 1 for the right one, [size] 1 for the
+     * full dot.
      */
-    fun lostMarker(camera: ArenaCamera, side: Float, strength: Float) {
+    private fun marker(camera: ArenaCamera, side: Float, size: Float, r: Float, g: Float, b: Float, strength: Float) {
         val distance = 1.4f
         val x = side * .40f; val y = -.34f
         val cx = camera.headX + camera.worldX(x, y, -distance); val cy = camera.headY + camera.worldY(x, y, -distance)
         val cz = camera.headZ + camera.worldZ(x, y, -distance)
         for (ring in 0..1) {
-            val radius = if (ring == 0) .050f else .032f
+            val radius = (if (ring == 0) .050f else .032f) * size
             // The disc lies in its x-z plane: x to the right, z up, and y towards the eyes.
             Place.frame(
                 model, camera.worldX(radius, 0f, 0f), camera.worldY(radius, 0f, 0f), camera.worldZ(radius, 0f, 0f),
@@ -282,8 +340,8 @@ class ColiseumDrawing {
                 camera.worldX(0f, radius, 0f), camera.worldY(0f, radius, 0f), camera.worldZ(0f, radius, 0f),
                 cx, cy, cz,
             )
-            if (ring == 0) draw(disc, model, .16f, .10f, .05f, .45f * strength, 0f)
-            else draw(disc, model, 1f, .70f, .22f, .85f * strength, 0f)
+            if (ring == 0) draw(disc, model, .14f, .14f, .14f, .45f * strength, 0f)
+            else draw(disc, model, r, g, b, .85f * strength, 0f)
         }
     }
 
@@ -366,22 +424,34 @@ class ColiseumDrawing {
         return p
     }
 
-    private companion object {
+    companion object {
+        /** Values of the dot of a hand in [scene]. */
+        const val MARK_NONE = -1
+        const val MARK_LOST = 0
+        const val MARK_HELD = 1
+        const val MARK_LIVE = 2
+        // Tracking that is valid, #35D07F, and tracking that is lost, #F05B54.
+        private const val LIVE_R = 0x35 / 255f
+        private const val LIVE_G = 0xD0 / 255f
+        private const val LIVE_B = 0x7F / 255f
+        private const val LOST_R = 0xF0 / 255f
+        private const val LOST_G = 0x5B / 255f
+        private const val LOST_B = 0x54 / 255f
         // The colours of the hand: skin #C99678, its shade #98694F, nails #E3B7A0. The soft light
         // on it, #FFE4C2, is in the shader.
-        const val SKIN_R = 0xC9 / 255f
-        const val SKIN_G = 0x96 / 255f
-        const val SKIN_B = 0x78 / 255f
-        const val SHADE_R = 0x98 / 255f
-        const val SHADE_G = 0x69 / 255f
-        const val SHADE_B = 0x4F / 255f
-        const val NAIL_R = 0xE3 / 255f
-        const val NAIL_G = 0xB7 / 255f
-        const val NAIL_B = 0xA0 / 255f
-        /** Bones inside the palm: from the wrist to the base of each finger, and along the knuckles. */
+        private const val SKIN_R = 0xC9 / 255f
+        private const val SKIN_G = 0x96 / 255f
+        private const val SKIN_B = 0x78 / 255f
+        private const val SHADE_R = 0x98 / 255f
+        private const val SHADE_G = 0x69 / 255f
+        private const val SHADE_B = 0x4F / 255f
+        private const val NAIL_R = 0xE3 / 255f
+        private const val NAIL_G = 0xB7 / 255f
+        private const val NAIL_B = 0xA0 / 255f
         /** How much thinner the far end of each bone of the arm is than its near end. */
-        const val TAPER = .82f
-        val PALM_BONES = intArrayOf(0, 1, 0, 5, 0, 9, 0, 13, 0, 17, 5, 9, 9, 13, 13, 17)
+        private const val TAPER = .82f
+        /** Bones inside the palm: from the wrist to the base of each finger, and along the knuckles. */
+        private val PALM_BONES = intArrayOf(0, 1, 0, 5, 0, 9, 0, 13, 0, 17, 5, 9, 9, 13, 13, 17)
     }
 }
 
